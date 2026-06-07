@@ -170,6 +170,10 @@ export const ANTIGRAVITY_MODEL_ALIAS: Readonly<Record<string, string>> = Object.
   'gemini-3.5-flash-medium': 'gemini-3.5-flash-low',
   'gemini-3.5-flash-low': 'gemini-3.5-flash-extra-low',
   'gemini-3.5-flash': 'gemini-3.5-flash-low',
+  // The agent endpoint only accepts the `-agent` backend ids; the friendly Pro id
+  // `gemini-3.1-pro-high` 400s (INVALID_ARGUMENT). Route it to the callable Pro agent —
+  // same enum tier (M16, budget 10001) — so codex-g-max works. Mirrors flash-high→flash-agent.
+  'gemini-3.1-pro-high': 'gemini-pro-agent',
 })
 
 export const ANTIGRAVITY_DEFAULT_MODEL = 'gemini-3-flash-agent'

@@ -284,7 +284,12 @@ Bun.serve({
           toolCount: Array.isArray(responsesReq.tools) ? responsesReq.tools.length : 0,
           body: responsesReq,
         })
-        const anthropicReq = decodeResponsesToAnthropic(responsesReq)
+        const { request: anthropicReq, namespaceTools, droppedNamespaces } =
+          decodeResponsesToAnthropic(responsesReq)
+        if (droppedNamespaces.length > 0) {
+          // Gemini's 128-tool cap forced these namespaces out; surface it, never silently truncate.
+          devlog(trace, 'tools_capped', { kept: namespaceTools.size, dropped: droppedNamespaces })
+        }
         anthropicReq.model = resolveModel(anthropicReq.model, userText(responsesReq)).model // haiku→cheap, 思考→high
         const provider = pickWireProvider({ model: anthropicReq.model })
         if (!provider) {
@@ -302,7 +307,7 @@ Bun.serve({
         })
         if (!anthropicResponse.ok) return anthropicResponse
 
-        const stream = encodeAnthropicToResponsesSSE(anthropicResponse, responsesReq.model, trace)
+        const stream = encodeAnthropicToResponsesSSE(anthropicResponse, responsesReq.model, trace, namespaceTools)
         return new Response(stream, {
           headers: {
             'Content-Type': 'text/event-stream',

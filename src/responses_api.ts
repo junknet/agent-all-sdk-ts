@@ -60,13 +60,49 @@ function dataUrlToImageBlock(imageUrl: string): AnthropicContentBlock | null {
   return { type: 'image', source: { type: 'base64', media_type: m[1]!, data: m[2]! } }
 }
 
+// ── namespaced (tool-search grouped) tool flattening ─────────────────
+// codex exposes sub-agents (`multi_agent_v1`) and every MCP server as `type:"namespace"`
+// tool groups (provider capability `namespace_tools`, default-on for any provider). The
+// Gemini backend has no namespace concept — it only knows flat JSON function calls — so we
+// expand each group into standalone function tools named `${namespace}${member}` (codex's
+// own ToolName flat form), then reverse that on the response edge. Reversal is by an
+// explicit per-request map, not by re-parsing the flat string: codex dispatches on the
+// (namespace, short-name) pair (`router` checks `tool_name.name == "spawn_agent"`), so the
+// returned function_call MUST carry `namespace` + the short member name, never the flat one.
+export type NamespaceToolMap = Map<string, { namespace: string; name: string }>
+
+function flattenNamespacedName(namespace: string, name: string): string {
+  return `${namespace}${name}`
+}
+
+// Gemini hard-caps a request at 128 function declarations; the stricter Pro backends reject
+// (400 INVALID_ARGUMENT) above it while the lenient Flash backends silently keep only the
+// first N. Flattening every namespace blows past this (codex ships ~217 with all MCP apps).
+// Plain tools + sub-agents are always kept; remaining namespaces are admitted whole-group in
+// priority order until the budget is spent, and the rest are reported via droppedNamespaces.
+const MAX_GEMINI_TOOLS: number = (() => {
+  const v = Number(process.env.AGENT_GATEWAY_MAX_GEMINI_TOOLS)
+  return Number.isFinite(v) && v > 0 ? v : 128
+})()
+
 // ── tools: Responses tool defs → Anthropic tool defs ─────────────────
-function decodeTools(tools: any[] | undefined): AnthropicTool[] | undefined {
+function decodeTools(
+  tools: any[] | undefined,
+  namespaceTools: NamespaceToolMap,
+  droppedNamespaces: string[],
+): AnthropicTool[] | undefined {
   if (!Array.isArray(tools) || tools.length === 0) return undefined
   const out: AnthropicTool[] = []
+  const groups: Array<{ namespace: string; members: any[] }> = []
   for (const t of tools) {
     if (!t || typeof t !== 'object') continue
-    if (t.type === 'function' || t.name) {
+    if (t.type === 'namespace' && Array.isArray(t.tools)) {
+      // Each member carries its full function schema inline; defer flattening until budgeting.
+      groups.push({
+        namespace: String(t.name ?? ''),
+        members: t.tools.filter((m: any) => m && typeof m === 'object' && m.name),
+      })
+    } else if (t.type === 'function' || t.name) {
       out.push({
         name: t.name,
         description: t.description ?? '',
@@ -87,6 +123,24 @@ function decodeTools(tools: any[] | undefined): AnthropicTool[] | undefined {
     }
     // builtins (local_shell / web_search / image_generation) are dropped: the Gemini
     // backend cannot execute them. codex falls back to function tools for file work.
+  }
+  // Sub-agents first (the whole point of namespacing here); rest keep codex's order, which
+  // already trails the bulky built-in apps (codex_apps github/drive) so they drop first.
+  groups.sort((a, b) => Number(b.namespace === 'multi_agent_v1') - Number(a.namespace === 'multi_agent_v1'))
+  for (const g of groups) {
+    if (out.length + g.members.length > MAX_GEMINI_TOOLS) {
+      droppedNamespaces.push(`${g.namespace}(${g.members.length})`)
+      continue
+    }
+    for (const m of g.members) {
+      const flat = flattenNamespacedName(g.namespace, m.name)
+      namespaceTools.set(flat, { namespace: g.namespace, name: m.name })
+      out.push({
+        name: flat,
+        description: m.description ?? '',
+        input_schema: m.parameters ?? { type: 'object', properties: {} },
+      })
+    }
   }
   return out.length > 0 ? out : undefined
 }
@@ -114,7 +168,13 @@ function decodeMessageContent(content: unknown): AnthropicContentBlock[] {
  * adapters consume. Groups consecutive same-role items into single messages so the
  * downstream Gemini/Claude backends see clean alternating turns.
  */
-export function decodeResponsesToAnthropic(req: any): AnthropicMessagesRequest {
+export function decodeResponsesToAnthropic(req: any): {
+  request: AnthropicMessagesRequest
+  namespaceTools: NamespaceToolMap
+  droppedNamespaces: string[]
+} {
+  const namespaceTools: NamespaceToolMap = new Map()
+  const droppedNamespaces: string[] = []
   const systemTexts: string[] = []
   if (typeof req.instructions === 'string' && req.instructions) systemTexts.push(req.instructions)
 
@@ -152,17 +212,26 @@ export function decodeResponsesToAnthropic(req: any): AnthropicMessagesRequest {
         for (const b of decodeMessageContent(item.content)) push(role, b)
         break
       }
-      case 'function_call':
+      case 'function_call': {
+        // Replayed namespaced calls carry a separate `namespace` field; codex may serialize
+        // `name` as either the short member or the full flat form. Normalize to the same flat
+        // name the tool defs use so the Gemini backend sees a consistent symbol across turns.
+        const ns = typeof item.namespace === 'string' && item.namespace ? item.namespace : undefined
+        const rawName = typeof item.name === 'string' ? item.name : ''
+        const shortName = ns && rawName.startsWith(ns) ? rawName.slice(ns.length) : rawName
+        const flatName = ns ? flattenNamespacedName(ns, shortName) : rawName
+        if (ns) namespaceTools.set(flatName, { namespace: ns, name: shortName })
         push('assistant', {
           type: 'tool_use',
           id: item.call_id ?? item.id ?? genId('call'),
-          name: item.name ?? '',
+          name: flatName,
           input: (tryParseJSON<Record<string, unknown>>(item.arguments ?? '{}') ?? {}) as Record<
             string,
             unknown
           >,
         })
         break
+      }
       case 'custom_tool_call':
         push('assistant', {
           type: 'tool_use',
@@ -195,7 +264,7 @@ export function decodeResponsesToAnthropic(req: any): AnthropicMessagesRequest {
     stream: true,
   }
   if (systemTexts.length > 0) out.system = systemTexts.join('\n\n')
-  const tools = decodeTools(req.tools)
+  const tools = decodeTools(req.tools, namespaceTools, droppedNamespaces)
   if (tools) out.tools = tools
   if (req.max_output_tokens) out.max_tokens = req.max_output_tokens
   if (typeof req.temperature === 'number') out.temperature = req.temperature
@@ -204,7 +273,7 @@ export function decodeResponsesToAnthropic(req: any): AnthropicMessagesRequest {
   if (thinking) out.thinking = thinking
   const tc = toolChoice(req.tool_choice)
   if (tc) out.tool_choice = tc
-  return out
+  return { request: out, namespaceTools, droppedNamespaces }
 }
 
 function outputToString(output: unknown): string {
@@ -238,6 +307,7 @@ interface OutItem {
   kind: 'text' | 'thinking' | 'tool'
   callId?: string
   name?: string
+  namespace?: string
   buf: string
   final: Record<string, unknown> | null
 }
@@ -251,6 +321,7 @@ export function encodeAnthropicToResponsesSSE(
   anthropicResponse: Response,
   model: string,
   trace?: string,
+  namespaceTools?: NamespaceToolMap,
 ): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder()
   const responseId = genId('resp')
@@ -302,12 +373,18 @@ export function encodeAnthropicToResponsesSSE(
               const idx: number = data.index
               const cb = data.content_block ?? {}
               if (cb.type === 'tool_use') {
+                // Reverse namespace flattening: a flat name we minted on the request edge maps
+                // back to (namespace, short member) — codex dispatches on that pair, not the
+                // flat string. Plain tools (not in the map) pass through unchanged.
+                const flatName = cb.name ?? ''
+                const nsEntry = namespaceTools?.get(flatName)
                 const it: OutItem = {
                   outputIndex: outputCounter++,
                   itemId: genId('fc'),
                   kind: 'tool',
                   callId: cb.id ?? genId('call'),
-                  name: cb.name ?? '',
+                  name: nsEntry ? nsEntry.name : flatName,
+                  namespace: nsEntry?.namespace,
                   buf: '',
                   final: null,
                 }
@@ -321,6 +398,7 @@ export function encodeAnthropicToResponsesSSE(
                     status: 'in_progress',
                     call_id: it.callId,
                     name: it.name,
+                    ...(it.namespace ? { namespace: it.namespace } : {}),
                     arguments: '',
                   },
                 })
@@ -443,6 +521,7 @@ export function encodeAnthropicToResponsesSSE(
                   status: 'completed',
                   call_id: it.callId,
                   name: it.name,
+                  ...(it.namespace ? { namespace: it.namespace } : {}),
                   arguments: it.buf,
                 }
               }
