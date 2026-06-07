@@ -42,8 +42,11 @@ export function resolveModel(
   userText: string,
 ): { model: string; escalated: boolean } {
   const m = remapModel(model)
-  // only escalate gemini gears, and never downgrade an explicit high/pro pick
-  if (/^gemini/i.test(m) && m !== HIGH_GEAR && THINK_TRIGGER.test(userText)) {
+  // 「思考」escalation lifts a LOWER flash gear to the high flash gear. It must never
+  // touch a Pro pick (gemini-3.1-pro-*) — that's a bigger model, not a budget tier;
+  // escalating it to a flash gear would be a DOWNGRADE.
+  const isLowerFlashGear = /flash/i.test(m) && m !== HIGH_GEAR
+  if (isLowerFlashGear && THINK_TRIGGER.test(userText)) {
     return { model: HIGH_GEAR, escalated: true }
   }
   return { model: m, escalated: false }
