@@ -2,32 +2,7 @@
  * Agent Gateway HTTP server implemented using Bun.serve
  */
 
-import { pickWireProvider, createWireAdapter, resolveModel } from './index.js'
-
-// Pull user-authored text from an inbound request (any protocol) so the gateway can
-// detect the 「思考」 escalation trigger. Only user-role text — not assistant/tool output.
-function userText(body: any): string {
-  const out: string[] = []
-  const pushContent = (c: any) => {
-    if (typeof c === 'string') out.push(c)
-    else if (Array.isArray(c))
-      for (const b of c) {
-        if (typeof b?.text === 'string') out.push(b.text)
-        if (typeof b?.content === 'string') out.push(b.content) // codex input_text variants
-      }
-  }
-  // anthropic /v1/messages + openai /v1/chat
-  if (Array.isArray(body?.messages))
-    for (const m of body.messages) if (m?.role === 'user') pushContent(m.content)
-  // codex /v1/responses input[]
-  if (Array.isArray(body?.input))
-    for (const it of body.input) {
-      if (it?.type === 'message' && it.role === 'user') pushContent(it.content)
-      else if (typeof it === 'string') out.push(it)
-    }
-  if (typeof body?.instructions === 'string') out.push(body.instructions)
-  return out.join('\n')
-}
+import { pickWireProvider, createWireAdapter, resolveModel, latestUserInput } from './index.js'
 import { iterSSE } from './sse.js'
 import { decodeResponsesToAnthropic, encodeAnthropicToResponsesSSE } from './responses_api.js'
 import { createAntigravityProvider, ANTIGRAVITY_DEFAULT_MODEL } from './providers/antigravity_provider.js'
@@ -230,7 +205,7 @@ Bun.serve({
         const body = JSON.parse(bodyText)
         const cid = identifyClient(req, 'messages', body)
         const origModel = body.model
-        const resolved = resolveModel(body.model, userText(body)) // haiku→cheap, 思考→high
+        const resolved = resolveModel(body.model, latestUserInput(body)) // haiku→cheap, 思考→high(仅看最近一次人类输入)
         body.model = resolved.model
         setTraceMeta(trace, { harness: cid.harness, model: body.model, session: cid.session, ua: cid.ua, requested: origModel, escalated: resolved.escalated })
         devlog(trace, 'inbound', {
@@ -290,7 +265,7 @@ Bun.serve({
           // Gemini's 128-tool cap forced these namespaces out; surface it, never silently truncate.
           devlog(trace, 'tools_capped', { kept: namespaceTools.size, dropped: droppedNamespaces })
         }
-        anthropicReq.model = resolveModel(anthropicReq.model, userText(responsesReq)).model // haiku→cheap, 思考→high
+        anthropicReq.model = resolveModel(anthropicReq.model, latestUserInput(responsesReq)).model // haiku→cheap, 思考→high(仅看最近一次人类输入)
         const provider = pickWireProvider({ model: anthropicReq.model })
         if (!provider) {
           devlog(trace, 'error', { at: 'pickProvider', model: anthropicReq.model })
@@ -339,7 +314,7 @@ Bun.serve({
           body: openaiReq,
         })
         const anthropicReq = translateOpenAIToAnthropic(openaiReq)
-        anthropicReq.model = resolveModel(anthropicReq.model, userText(openaiReq)).model // haiku→cheap, 思考→high
+        anthropicReq.model = resolveModel(anthropicReq.model, latestUserInput(openaiReq)).model // haiku→cheap, 思考→high(仅看最近一次人类输入)
 
         const provider = pickWireProvider({ model: anthropicReq.model })
         if (!provider) {

@@ -52,6 +52,53 @@ export function resolveModel(
   return { model: m, escalated: false }
 }
 
+// Extract ONLY the latest human-authored user turn from an inbound request (any protocol),
+// for the 「思考」 escalation trigger. This makes escalation a per-input STATE MACHINE, not a
+// sticky-forever flag: a tool-loop continuation request carries no new human turn (its last
+// user message is a tool_result), so the latest human turn stays the same and 「思考」 keeps
+// holding across the whole agent loop — then the NEXT human input redefines the state (no
+// 「思考」 → back to base). Scanning all historical user messages (the old behaviour) made one
+// 「思考」 anywhere in context escalate forever; tool_result/assistant/system are never input.
+export function latestUserInput(body: any): string {
+  // A human turn has real input blocks; a tool_result continuation has only tool_result.
+  const isHumanTurn = (c: any): boolean =>
+    typeof c === 'string'
+      ? c.length > 0
+      : Array.isArray(c)
+        ? c.some((b: any) => b?.type !== 'tool_result')
+        : false
+  // Concatenate the turn's text blocks (anthropic `text`, codex `input_text`); skip tool_result.
+  const textOf = (c: any): string =>
+    typeof c === 'string'
+      ? c
+      : Array.isArray(c)
+        ? c
+            .filter((b: any) => typeof b?.text === 'string' && b.type !== 'tool_result')
+            .map((b: any) => b.text)
+            .join('\n')
+        : ''
+
+  // anthropic /v1/messages + openai /v1/chat: newest user message that is a human turn.
+  // (Anthropic tool_result is role 'user' → skipped via isHumanTurn; OpenAI tool results are
+  //  role 'tool' → skipped via the role check.)
+  if (Array.isArray(body?.messages)) {
+    for (let i = body.messages.length - 1; i >= 0; i--) {
+      const m = body.messages[i]
+      if (m?.role !== 'user' || !isHumanTurn(m.content)) continue
+      return textOf(m.content)
+    }
+  }
+  // codex /v1/responses input[]: newest user message item (skip function_call_output tool results).
+  if (Array.isArray(body?.input)) {
+    for (let i = body.input.length - 1; i >= 0; i--) {
+      const it = body.input[i]
+      if (typeof it === 'string') return it
+      if (it?.type === 'message' && it.role === 'user') return textOf(it.content)
+    }
+  }
+  return ''
+}
+
 export function pickWireProvider(opts: PickProviderOpts): WireProvider | null {
   const truthy = (v: string | undefined): boolean =>
     !!v && !['0', 'false', 'no', ''].includes(v.toLowerCase())
