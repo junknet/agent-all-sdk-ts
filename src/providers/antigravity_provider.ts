@@ -359,6 +359,12 @@ export function createAntigravityProvider(opts: AntigravityOpts): WireProvider {
             const fc = part.functionCall
             const id = fc.id ?? `call_${fc.name}_${Math.random().toString(16).slice(2, 10)}`
             const name = fc.name ?? ''
+            // Gemini emits the reasoning signature as a sibling of functionCall on the part.
+            // Stash it by call_id so the NEXT turn can replay the real signature (see
+            // translateMessages) instead of the validator-bypass placeholder.
+            if (typeof part.thoughtSignature === 'string' && part.thoughtSignature) {
+              rememberThoughtSig(id, part.thoughtSignature)
+            }
             emitter.openToolUse(id, name)
             if (fc.args !== undefined) {
               emitter.pushToolArgsDelta(JSON.stringify(fc.args))
@@ -461,6 +467,27 @@ function collectToolNamesById(messages: AnthropicMessage[]): Map<string, string>
   return map
 }
 
+// Gemini ties multi-turn reasoning to a per-functionCall `thoughtSignature`: it MUST be
+// replayed with that functionCall on later turns, or the model loses its reasoning thread
+// across the tool loop → re-planning loops, MALFORMED_FUNCTION_CALL, and 400 INVALID_ARGUMENT.
+// The signature cannot survive a codex/openai round-trip (no wire field carries it), so we
+// cache it server-side keyed by call_id — which is stable end-to-end (gemini functionCall.id
+// → codex call_id → replayed tool_use.id) — and re-attach it in translateMessages instead of
+// the `skip_thought_signature_validator` bypass placeholder (which carries no reasoning and is
+// what made the agent loop). Module-level so it persists across the per-request provider
+// instances; bounded to cap memory on the long-lived daemon.
+const THOUGHT_SIG_CACHE_MAX = 4096
+const thoughtSigByCallId = new Map<string, string>()
+function rememberThoughtSig(callId: string, signature: string): void {
+  if (!callId || !signature) return
+  if (thoughtSigByCallId.has(callId)) thoughtSigByCallId.delete(callId) // refresh LRU position
+  thoughtSigByCallId.set(callId, signature)
+  if (thoughtSigByCallId.size > THOUGHT_SIG_CACHE_MAX) {
+    const oldest = thoughtSigByCallId.keys().next().value
+    if (oldest !== undefined) thoughtSigByCallId.delete(oldest)
+  }
+}
+
 function translateMessages(
   messages: AnthropicMessage[],
   toolNameByID: Map<string, string>,
@@ -483,7 +510,13 @@ function translateMessages(
         } else if (block.type === 'tool_use') {
           parts.push({
             functionCall: { id: block.id, name: block.name, args: block.input ?? {} },
-            thoughtSignature: (block as any).thoughtSignature ?? 'skip_thought_signature_validator',
+            // Prefer the REAL signature gemini emitted for this call_id (cached on the prior
+            // turn); fall back to the inline block field, then the bypass placeholder only when
+            // we genuinely never saw a signature (e.g. a tool call that didn't originate here).
+            thoughtSignature:
+              (block as any).thoughtSignature ??
+              thoughtSigByCallId.get(block.id ?? '') ??
+              'skip_thought_signature_validator',
           })
         } else if (block.type === 'tool_result') {
           parts.push({
