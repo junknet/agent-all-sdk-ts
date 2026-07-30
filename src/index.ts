@@ -11,11 +11,12 @@ import { createOpenaiCompatProvider } from './providers/openai_compat_provider.j
 import { createCodexProvider } from './providers/codex_provider.js'
 import { createAntigravityProvider, ANTIGRAVITY_DEFAULT_MODEL } from './providers/antigravity_provider.js'
 import { createAnthropicPassthroughProvider } from './providers/anthropic_passthrough_provider.js'
-import { detectLocalCredits } from './auth.js'
+import { detectLocalCredits, type CustomTokens } from './auth.js'
 
 export interface PickProviderOpts {
   model?: string
   apiKey?: string
+  customTokens?: CustomTokens
 }
 
 // Gateway-level model remap. Clients (e.g. claude-code) use a cheap "fast/background"
@@ -103,6 +104,19 @@ export function pickWireProvider(opts: PickProviderOpts): WireProvider | null {
   const truthy = (v: string | undefined): boolean =>
     !!v && !['0', 'false', 'no', ''].includes(v.toLowerCase())
 
+  const credits = detectLocalCredits(opts)
+
+  // 0. 单后端强制出口：锁定到指定 OpenAI 兼容后端（自部署 vLLM 等），绕过按 model
+  //    分流 / gemini 评测路由 / 本地凭据探测。用于「三协议统一入口 → 单一模型」部署，
+  //    任何入口协议、任何 model 名都落到同一后端；实际 model 由 OPENAI_MODEL 固定。
+  if (truthy(process.env.FORCE_OPENAI_COMPAT)) {
+    return createOpenaiCompatProvider({
+      baseURL: process.env.OPENAI_BASE_URL ?? '',
+      apiKey: process.env.OPENAI_API_KEY ?? opts.apiKey ?? '',
+      model: process.env.OPENAI_MODEL ?? process.env.OPENAI_COMPAT_MODEL ?? opts.model ?? '',
+    })
+  }
+
   // 1. Anthropic passthrough
   if (truthy(process.env.CLAUDE_CODE_USE_CUSTOM_ANTHROPIC)) {
     return createAnthropicPassthroughProvider({
@@ -115,14 +129,15 @@ export function pickWireProvider(opts: PickProviderOpts): WireProvider | null {
   // 2. Antigravity / Gemini OAuth
   const modelLower = opts.model?.toLowerCase() ?? ''
   if (truthy(process.env.CLAUDE_CODE_USE_ANTIGRAVITY) || modelLower.includes('gemini')) {
+    const geminiCredit = credits.find(c => c.provider === 'gemini')
     return createAntigravityProvider({
       model: process.env.ANTIGRAVITY_MODEL ?? opts.model ?? ANTIGRAVITY_DEFAULT_MODEL,
+      source: geminiCredit?.type === 'oauth' ? geminiCredit.source : undefined,
     })
   }
 
   // 2.5 Claude (Anthropic API / OAuth)
   if (modelLower.includes('claude') || process.env.ANTHROPIC_API_KEY) {
-    const credits = detectLocalCredits()
     const claudeCredit = credits.find(c => c.provider === 'claude')
     if (claudeCredit) {
       if (claudeCredit.type === 'oauth' && claudeCredit.source) {
@@ -130,20 +145,19 @@ export function pickWireProvider(opts: PickProviderOpts): WireProvider | null {
           baseURL: process.env.ANTHROPIC_BASE_URL ?? 'https://api.anthropic.com',
           apiKey: '',
           source: claudeCredit.source,
-          model: opts.model ?? 'claude-3-7-sonnet',
+          model: opts.model ?? 'claude-opus-5',
         })
       } else if (claudeCredit.type === 'api_key' && claudeCredit.value) {
         return createAnthropicPassthroughProvider({
           baseURL: process.env.ANTHROPIC_BASE_URL ?? 'https://api.anthropic.com',
           apiKey: claudeCredit.value,
-          model: opts.model ?? 'claude-3-7-sonnet',
+          model: opts.model ?? 'claude-opus-5',
         })
       }
     }
   }
 
   // 3. Codex (ChatGPT subscriber)
-  const credits = detectLocalCredits()
   const codexCredit = credits.find(c => c.provider === 'codex')
   if (codexCredit) {
     if (codexCredit.type === 'oauth' && codexCredit.source) {
@@ -158,7 +172,7 @@ export function pickWireProvider(opts: PickProviderOpts): WireProvider | null {
       baseURL:
         process.env.GEMINI_BASE_URL ?? 'https://generativelanguage.googleapis.com/v1beta/openai',
       apiKey: process.env.GEMINI_API_KEY ?? geminiCredit?.value ?? '',
-      model: process.env.GEMINI_MODEL ?? opts.model ?? 'gemini-2.5-flash',
+      model: process.env.GEMINI_MODEL ?? opts.model ?? 'gemini-3.6-flash',
     })
   }
 
@@ -168,7 +182,6 @@ export function pickWireProvider(opts: PickProviderOpts): WireProvider | null {
     truthy(process.env.CLAUDE_CODE_USE_OPENAI_COMPAT) ||
     modelLower.includes('gpt-') || modelLower.includes('o1-') || modelLower.includes('o3-')
   ) {
-    const codexCredit = credits.find(c => c.provider === 'codex')
     const apiKey = process.env.OPENAI_API_KEY ?? opts.apiKey ?? (codexCredit?.type === 'api_key' ? codexCredit.value : '') ?? ''
     return createOpenaiCompatProvider({
       baseURL: process.env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1',

@@ -3,11 +3,13 @@
  */
 
 import { pickWireProvider, createWireAdapter, resolveModel, latestUserInput } from './index.js'
-import { iterSSE } from './sse.js'
+import { pickIngressAdapter } from './ingress.js'
 import { decodeResponsesToAnthropic, encodeAnthropicToResponsesSSE } from './responses_api.js'
 import { createAntigravityProvider, ANTIGRAVITY_DEFAULT_MODEL } from './providers/antigravity_provider.js'
 import { createCodexProvider } from './providers/codex_provider.js'
+import { createAnthropicPassthroughProvider } from './providers/anthropic_passthrough_provider.js'
 import { detectLocalCredits } from './auth.js'
+import { slimAnthropicRequest } from './slim.js'
 import { devlog, newTrace, setTraceMeta } from './devlog.js'
 
 // Identify the connecting harness + conversation session from inbound headers/body, so
@@ -47,9 +49,9 @@ const PORT = Number(process.env.AGENT_GATEWAY_PORT ?? 8085)
 // ── Model listing ──────────────────────────────────────────────────
 // Fallback only — used if every provider's live catalog fetch fails.
 const FALLBACK_MODELS = [
-  { id: 'gemini-3-flash', name: 'Gemini 3 Flash' },
-  { id: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
-  { id: 'gpt-5.2-codex', name: 'GPT-5.2 Codex' },
+  { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash' },
+  { id: 'claude-opus-5', name: 'Claude Opus 5' },
+  { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' },
 ]
 
 // listAllModels aggregates each backend's authoritative catalog (gemini via
@@ -64,8 +66,9 @@ async function listAllModels(): Promise<Array<{ id: string; name: string }>> {
   } catch (e: any) {
     console.error('listModels antigravity failed:', e?.message ?? e)
   }
+  const credits = detectLocalCredits()
   try {
-    const codexCredit = detectLocalCredits().find(c => c.provider === 'codex')
+    const codexCredit = credits.find(c => c.provider === 'codex')
     if (codexCredit?.type === 'oauth' && codexCredit.source) {
       const cx = createCodexProvider({ source: codexCredit.source })
       await cx.prepare?.()
@@ -74,110 +77,24 @@ async function listAllModels(): Promise<Array<{ id: string; name: string }>> {
   } catch (e: any) {
     console.error('listModels codex failed:', e?.message ?? e)
   }
-  return out.length > 0 ? out : FALLBACK_MODELS
-}
-
-// ── OpenAI to Anthropic Request Translator ─────────────────────────
-function translateOpenAIToAnthropic(openaiReq: any): any {
-  const messages: any[] = []
-  let systemPrompt = ''
-
-  if (Array.isArray(openaiReq.messages)) {
-    for (const msg of openaiReq.messages) {
-      if (msg.role === 'system') {
-        systemPrompt = (systemPrompt ? systemPrompt + '\n' : '') + msg.content
-      } else {
-        messages.push({
-          role: msg.role === 'assistant' ? 'assistant' : 'user',
-          content: msg.content,
-        })
-      }
-    }
-  }
-
-  const req: any = {
-    model: openaiReq.model,
-    messages,
-    stream: openaiReq.stream ?? false,
-  }
-
-  if (systemPrompt) req.system = systemPrompt
-  if (openaiReq.max_tokens) req.max_tokens = openaiReq.max_tokens
-  if (typeof openaiReq.temperature === 'number') req.temperature = openaiReq.temperature
-  if (typeof openaiReq.top_p === 'number') req.top_p = openaiReq.top_p
-
-  if (Array.isArray(openaiReq.tools)) {
-    req.tools = openaiReq.tools.map((t: any) => ({
-      name: t.function?.name,
-      description: t.function?.description,
-      input_schema: t.function?.parameters,
-    }))
-  }
-
-  return req
-}
-
-// ── Anthropic SSE to OpenAI completion chunk ─────────────────────────
-function translateAnthropicToOpenAISSE(event: { event?: string; data: string }, model: string): string | null {
   try {
-    const payload = JSON.parse(event.data)
-    const id = `chatcmpl-${Date.now().toString(36)}`
-
-    const baseChunk = (delta: any, finishReason: string | null = null) => {
-      return JSON.stringify({
-        id,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model,
-        choices: [{
-          index: 0,
-          delta,
-          finish_reason: finishReason,
-        }],
+    const claudeCredit = credits.find(c => c.provider === 'claude')
+    if (claudeCredit) {
+      const cl = createAnthropicPassthroughProvider({
+        baseURL: process.env.ANTHROPIC_BASE_URL ?? 'https://api.anthropic.com',
+        apiKey: claudeCredit.type === 'api_key' ? (claudeCredit.value ?? '') : '',
+        model: 'claude-opus-5',
+        ...(claudeCredit.type === 'oauth' && claudeCredit.source
+          ? { source: claudeCredit.source }
+          : {}),
       })
+      await cl.prepare?.()
+      if (cl.listModels) out.push(...(await cl.listModels()))
     }
-
-    if (payload.type === 'content_block_delta') {
-      const delta = payload.delta
-      if (delta.type === 'text_delta') {
-        return `data: ${baseChunk({ content: delta.text })}\n\n`
-      }
-      if (delta.type === 'thinking_delta') {
-        return `data: ${baseChunk({ reasoning_content: delta.thinking })}\n\n`
-      }
-      if (delta.type === 'input_json_delta') {
-        return `data: ${baseChunk({
-          tool_calls: [{
-            index: payload.index ?? 0,
-            function: { arguments: delta.partial_json },
-          }],
-        })}\n\n`
-      }
-    }
-
-    if (payload.type === 'content_block_start' && payload.content_block?.type === 'tool_use') {
-      const tool = payload.content_block
-      return `data: ${baseChunk({
-        tool_calls: [{
-          index: payload.index ?? 0,
-          id: tool.id,
-          type: 'function',
-          function: { name: tool.name, arguments: '' },
-        }],
-      })}\n\n`
-    }
-
-    if (payload.type === 'message_delta') {
-      const stopReason = payload.delta?.stop_reason
-      const mappedReason = stopReason === 'end_turn' ? 'stop' : stopReason === 'tool_use' ? 'tool_calls' : stopReason
-      return `data: ${baseChunk({}, mappedReason)}\n\n`
-    }
-
-    if (payload.type === 'message_stop') {
-      return 'data: [DONE]\n\n'
-    }
-  } catch {}
-  return null
+  } catch (e: any) {
+    console.error('listModels claude failed:', e?.message ?? e)
+  }
+  return out.length > 0 ? out : FALLBACK_MODELS
 }
 
 // ── HTTP Gateway Server ─────────────────────────────────────────────
@@ -187,6 +104,22 @@ Bun.serve({
   port: PORT,
   async fetch(req) {
     const url = new URL(req.url)
+
+    // 入口鉴权：对外暴露时校验 Bearer key。GATEWAY_API_KEY 未设则不校验（纯内网/开发）。
+    const requiredKey = process.env.GATEWAY_API_KEY
+    if (requiredKey) {
+      const auth = req.headers.get('authorization') ?? ''
+      const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : ''
+      // OpenAI SDK 用 Authorization: Bearer；Anthropic SDK 用 x-api-key——两者都接受
+      const token = bearer || (req.headers.get('x-api-key') ?? '')
+      if (token !== requiredKey) {
+        return new Response(
+          JSON.stringify({ error: { message: 'Unauthorized', type: 'authentication_error' } }),
+          { status: 401, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+    }
+
     console.log(`HIT: ${req.method} ${url.pathname}`)
 
     // 1. Models endpoint — live aggregated catalog across backends
@@ -197,6 +130,14 @@ Bun.serve({
       })
     }
 
+    const customTokens = {
+      claudeAccessToken: req.headers.get('x-gateway-claude-access-token') || req.headers.get('x-gateway-claude-token') || undefined,
+      claudeRefreshToken: req.headers.get('x-gateway-claude-refresh-token') || undefined,
+      codexAccessToken: req.headers.get('x-gateway-codex-access-token') || req.headers.get('x-gateway-codex-token') || undefined,
+      codexRefreshToken: req.headers.get('x-gateway-codex-refresh-token') || undefined,
+      geminiAccessToken: req.headers.get('x-gateway-gemini-access-token') || req.headers.get('x-gateway-gemini-token') || undefined,
+    }
+
     // 2. Anthropic Messages API (claude-g)
     if (url.pathname === '/v1/messages' && req.method === 'POST') {
       const trace = newTrace()
@@ -205,34 +146,44 @@ Bun.serve({
         const body = JSON.parse(bodyText)
         const cid = identifyClient(req, 'messages', body)
         const origModel = body.model
-        const resolved = resolveModel(body.model, latestUserInput(body)) // haiku→cheap, 思考→high(仅看最近一次人类输入)
-        body.model = resolved.model
-        setTraceMeta(trace, { harness: cid.harness, model: body.model, session: cid.session, ua: cid.ua, requested: origModel, escalated: resolved.escalated })
+
+        const adapter = pickIngressAdapter('messages')
+        const anthropicReq = adapter.decodeRequest(body)
+
+        const resolved = resolveModel(anthropicReq.model, latestUserInput(body))
+        anthropicReq.model = resolved.model
+
+        const slim = slimAnthropicRequest(anthropicReq)
+        if (slim.on) console.log(`[slim] messages: tools ${slim.toolsBefore}→${slim.toolsAfter}, system ${slim.sysBefore}→${slim.sysAfter} chars`)
+
+        setTraceMeta(trace, { harness: cid.harness, model: anthropicReq.model, session: cid.session, ua: cid.ua, requested: origModel, escalated: resolved.escalated })
         devlog(trace, 'inbound', {
           protocol: 'messages',
           path: url.pathname,
-          model: body.model,
-          stream: body.stream,
-          thinking: body.thinking,
-          messageCount: Array.isArray(body.messages) ? body.messages.length : 0,
-          toolCount: Array.isArray(body.tools) ? body.tools.length : 0,
+          model: anthropicReq.model,
+          stream: anthropicReq.stream,
+          thinking: anthropicReq.thinking,
+          messageCount: Array.isArray(anthropicReq.messages) ? anthropicReq.messages.length : 0,
+          toolCount: Array.isArray(anthropicReq.tools) ? anthropicReq.tools.length : 0,
           body,
         })
-        const provider = pickWireProvider({ model: body.model })
+
+        const provider = pickWireProvider({ model: anthropicReq.model, customTokens })
         if (!provider) {
-          devlog(trace, 'error', { at: 'pickProvider', model: body.model })
-          return new Response(JSON.stringify({ error: `No provider found for model: ${body.model}` }), {
+          devlog(trace, 'error', { at: 'pickProvider', model: anthropicReq.model })
+          return new Response(JSON.stringify({ error: `No provider found for model: ${anthropicReq.model}` }), {
             status: 400,
             headers: { 'Content-Type': 'application/json' },
           })
         }
-        const adapter = createWireAdapter(provider)
-        const response = await adapter('https://api.anthropic.com/v1/messages', {
+        const wireAdapter = createWireAdapter(provider)
+        const response = await wireAdapter('https://api.anthropic.com/v1/messages', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-dev-trace': trace },
-          body: JSON.stringify(body), // remapped model
+          body: JSON.stringify(anthropicReq),
         })
-        return response
+
+        return adapter.encodeResponse(response, body, trace)
       } catch (err: any) {
         return new Response(JSON.stringify({ error: err.message }), {
           status: 500,
@@ -241,9 +192,7 @@ Bun.serve({
       }
     }
 
-    // 3. Codex Responses API (codex-g, wire_api="responses"): instructions + input[]
-    //    in, response.* events out. Distinct wire shape from chat completions — must
-    //    NOT be conflated (see responses_api.ts).
+    // 3. Codex Responses API (codex-g, wire_api="responses")
     if (url.pathname === '/v1/responses' && req.method === 'POST') {
       const trace = newTrace()
       try {
@@ -259,14 +208,19 @@ Bun.serve({
           toolCount: Array.isArray(responsesReq.tools) ? responsesReq.tools.length : 0,
           body: responsesReq,
         })
+
+        const adapter = pickIngressAdapter('responses')
         const { request: anthropicReq, namespaceTools, droppedNamespaces } =
           decodeResponsesToAnthropic(responsesReq)
+        
         if (droppedNamespaces.length > 0) {
-          // Gemini's 128-tool cap forced these namespaces out; surface it, never silently truncate.
           devlog(trace, 'tools_capped', { kept: namespaceTools.size, dropped: droppedNamespaces })
         }
-        anthropicReq.model = resolveModel(anthropicReq.model, latestUserInput(responsesReq)).model // haiku→cheap, 思考→high(仅看最近一次人类输入)
-        const provider = pickWireProvider({ model: anthropicReq.model })
+
+        anthropicReq.model = resolveModel(anthropicReq.model, latestUserInput(responsesReq)).model
+        const slimR = slimAnthropicRequest(anthropicReq)
+        if (slimR.on) console.log(`[slim] responses: tools ${slimR.toolsBefore}→${slimR.toolsAfter}, system ${slimR.sysBefore}→${slimR.sysAfter} chars`)
+        const provider = pickWireProvider({ model: anthropicReq.model, customTokens })
         if (!provider) {
           devlog(trace, 'error', { at: 'pickProvider', model: anthropicReq.model })
           return new Response(
@@ -274,22 +228,17 @@ Bun.serve({
             { status: 400, headers: { 'Content-Type': 'application/json' } },
           )
         }
-        const adapter = createWireAdapter(provider)
-        const anthropicResponse = await adapter('https://api.anthropic.com/v1/messages', {
+
+        const wireAdapter = createWireAdapter(provider)
+        const anthropicResponse = await wireAdapter('https://api.anthropic.com/v1/messages', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-dev-trace': trace },
           body: JSON.stringify({ ...anthropicReq, stream: true }),
         })
+
         if (!anthropicResponse.ok) return anthropicResponse
 
-        const stream = encodeAnthropicToResponsesSSE(anthropicResponse, responsesReq.model, trace, namespaceTools)
-        return new Response(stream, {
-          headers: {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            Connection: 'keep-alive',
-          },
-        })
+        return adapter.encodeResponse(anthropicResponse, responsesReq, trace, { namespaceTools })
       } catch (err: any) {
         return new Response(JSON.stringify({ error: err.message }), {
           status: 500,
@@ -298,7 +247,7 @@ Bun.serve({
       }
     }
 
-    // 4. OpenAI Chat Completions (openai-compat clients, e.g. jcode)
+    // 4. OpenAI Chat Completions (openai-compat clients)
     if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
       const trace = newTrace()
       try {
@@ -313,10 +262,15 @@ Bun.serve({
           messageCount: Array.isArray(openaiReq.messages) ? openaiReq.messages.length : 0,
           body: openaiReq,
         })
-        const anthropicReq = translateOpenAIToAnthropic(openaiReq)
-        anthropicReq.model = resolveModel(anthropicReq.model, latestUserInput(openaiReq)).model // haiku→cheap, 思考→high(仅看最近一次人类输入)
 
-        const provider = pickWireProvider({ model: anthropicReq.model })
+        const adapter = pickIngressAdapter('chat')
+        const anthropicReq = adapter.decodeRequest(openaiReq)
+        anthropicReq.model = resolveModel(anthropicReq.model, latestUserInput(openaiReq)).model
+
+        const slimC = slimAnthropicRequest(anthropicReq)
+        if (slimC.on) console.log(`[slim] chat: tools ${slimC.toolsBefore}→${slimC.toolsAfter}, system ${slimC.sysBefore}→${slimC.sysAfter} chars`)
+
+        const provider = pickWireProvider({ model: anthropicReq.model, customTokens })
         if (!provider) {
           devlog(trace, 'error', { at: 'pickProvider', model: anthropicReq.model })
           return new Response(JSON.stringify({ error: `No provider found for model: ${anthropicReq.model}` }), {
@@ -325,94 +279,16 @@ Bun.serve({
           })
         }
 
-        const adapter = createWireAdapter(provider)
-        const anthropicResponse = await adapter('https://api.anthropic.com/v1/messages', {
+        const wireAdapter = createWireAdapter(provider)
+        const anthropicResponse = await wireAdapter('https://api.anthropic.com/v1/messages', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-dev-trace': trace },
           body: JSON.stringify(anthropicReq),
         })
 
-        if (!anthropicResponse.ok) {
-          return anthropicResponse
-        }
+        if (!anthropicResponse.ok) return anthropicResponse
 
-        // Handle Non-Stream Response
-        if (!openaiReq.stream) {
-          const streamEvents = await iterSSE(anthropicResponse)
-          let content = ''
-          let reasoning = ''
-          const toolCalls: any[] = []
-
-          for await (const ev of streamEvents) {
-            try {
-              const payload = JSON.parse(ev.data)
-              if (payload.type === 'content_block_delta') {
-                if (payload.delta?.type === 'text_delta') content += payload.delta.text
-                if (payload.delta?.type === 'thinking_delta') reasoning += payload.delta.thinking
-                if (payload.delta?.type === 'input_json_delta') {
-                  const tc = toolCalls[payload.index ?? 0]
-                  if (tc) tc.function.arguments += payload.delta.partial_json
-                }
-              }
-              if (payload.type === 'content_block_start' && payload.content_block?.type === 'tool_use') {
-                const tc = payload.content_block
-                toolCalls[payload.index ?? 0] = {
-                  id: tc.id,
-                  type: 'function',
-                  function: { name: tc.name, arguments: '' },
-                }
-              }
-            } catch {}
-          }
-
-          const responseBody: Record<string, any> = {
-            id: `chatcmpl-${Date.now().toString(36)}`,
-            object: 'chat.completion',
-            created: Math.floor(Date.now() / 1000),
-            model: openaiReq.model,
-            choices: [{
-              index: 0,
-              message: {
-                role: 'assistant',
-                content: content || null,
-                ...(reasoning ? { reasoning_content: reasoning } : {}),
-                ...(toolCalls.length > 0 ? { tool_calls: toolCalls.filter(Boolean) } : {}),
-              },
-              finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
-            }],
-          }
-
-          return new Response(JSON.stringify(responseBody), {
-            headers: { 'Content-Type': 'application/json' },
-          })
-        }
-
-        // Handle Stream Response: Transform Anthropic SSE stream to OpenAI SSE stream
-        const encoder = new TextEncoder()
-        const transformStream = new ReadableStream<Uint8Array>({
-          async start(controller) {
-            try {
-              for await (const event of iterSSE(anthropicResponse)) {
-                const openaiChunk = translateAnthropicToOpenAISSE(event, openaiReq.model)
-                if (openaiChunk) {
-                  controller.enqueue(encoder.encode(openaiChunk))
-                }
-              }
-            } catch (err: any) {
-              console.error('SSE transformation failed:', err)
-            } finally {
-              controller.close()
-            }
-          },
-        })
-
-        return new Response(transformStream, {
-          headers: {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            Connection: 'keep-alive',
-          },
-        })
+        return adapter.encodeResponse(anthropicResponse, openaiReq, trace)
       } catch (err: any) {
         return new Response(JSON.stringify({ error: err.message }), {
           status: 500,

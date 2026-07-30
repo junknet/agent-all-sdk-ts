@@ -37,7 +37,21 @@ const CLIENT_ID =
   '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com'
 const CLIENT_SECRET =
   process.env.ANTIGRAVITY_CLIENT_SECRET || 'ANTIGRAVITY_CLIENT_SECRET_REMOVED'
-const TOKEN_PATH = path.join(os.homedir(), '.gemini', 'oauth_creds.json')
+function getGeminiTokenPath(): string {
+  const customDir = process.env.GATEWAY_CREDENTIALS_DIR
+  if (customDir) {
+    return path.join(customDir, 'gemini_oauth_creds.json')
+  }
+  const home = os.homedir()
+  const isWin = process.platform === 'win32'
+  if (isWin && process.env.APPDATA) {
+    const winPath = path.join(process.env.APPDATA, 'gemini', 'oauth_creds.json')
+    if (fs.existsSync(winPath)) return winPath
+  }
+  return path.join(home, '.gemini', 'oauth_creds.json')
+}
+
+const TOKEN_PATH = getGeminiTokenPath()
 const USER_AGENT = 'antigravity/fantasy/1.0.0 linux/amd64'
 const ENDPOINT =
   'https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse'
@@ -78,10 +92,11 @@ export async function getOrRefreshAccessToken(): Promise<string> {
   return store.access_token
 }
 
-let cachedProject: string | null = null
+const cachedProjectsByToken = new Map<string, string>()
 
 export async function getProject(accessToken: string): Promise<string> {
-  if (cachedProject) return cachedProject
+  const cached = cachedProjectsByToken.get(accessToken)
+  if (cached) return cached
   const res = await fetch(
     'https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist',
     {
@@ -102,8 +117,14 @@ export async function getProject(accessToken: string): Promise<string> {
   if (!data.cloudaicompanionProject) {
     throw new Error(`loadCodeAssist returned no cloudaicompanionProject`)
   }
-  cachedProject = data.cloudaicompanionProject
-  return cachedProject!
+  const project = data.cloudaicompanionProject
+  cachedProjectsByToken.set(accessToken, project)
+  // Prevent memory leaks in long-running gateway processes
+  if (cachedProjectsByToken.size > 2048) {
+    const firstKey = cachedProjectsByToken.keys().next().value
+    if (firstKey !== undefined) cachedProjectsByToken.delete(firstKey)
+  }
+  return project
 }
 
 // ── Schema cleaning ─────────────────────────────────────────────────────

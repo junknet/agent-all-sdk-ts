@@ -110,7 +110,7 @@ describe('E2E Matrix Tests', () => {
     test('Model ID Listing', async () => {
       if (skip) test.skip('No Codex credentials found')
 
-      const provider = pickWireProvider({ model: 'gpt-5.1' })
+      const provider = pickWireProvider({ model: 'gpt-5.6-sol' })
       expect(provider).not.toBeNull()
       await provider!.prepare?.()
 
@@ -123,7 +123,7 @@ describe('E2E Matrix Tests', () => {
     test('Quota Information', async () => {
       if (skip) test.skip('No Codex credentials found')
 
-      const provider = pickWireProvider({ model: 'gpt-5.1' })
+      const provider = pickWireProvider({ model: 'gpt-5.6-sol' })
       expect(provider).not.toBeNull()
       await provider!.prepare?.()
 
@@ -135,12 +135,12 @@ describe('E2E Matrix Tests', () => {
     test('LLM Text Conversation', async () => {
       if (skip) test.skip('No Codex credentials found')
 
-      const provider = pickWireProvider({ model: 'gpt-5.1' })
+      const provider = pickWireProvider({ model: 'gpt-5.6-sol' })
       expect(provider).not.toBeNull()
       const adapter = createWireAdapter(provider!)
 
       const req: AnthropicMessagesRequest = {
-        model: 'gpt-5.1',
+        model: 'gpt-5.6-sol',
         messages: [{ role: 'user', content: 'Say hello!' }],
         max_tokens: 50,
       }
@@ -175,7 +175,7 @@ describe('E2E Matrix Tests', () => {
     test('Model ID Listing', async () => {
       if (skip) test.skip('No Claude credentials found')
 
-      const provider = pickWireProvider({ model: 'claude-3-7-sonnet' })
+      const provider = pickWireProvider({ model: 'claude-opus-5' })
       expect(provider).not.toBeNull()
       await provider!.prepare?.()
 
@@ -188,7 +188,7 @@ describe('E2E Matrix Tests', () => {
     test('Quota Information', async () => {
       if (skip) test.skip('No Claude credentials found')
 
-      const provider = pickWireProvider({ model: 'claude-3-7-sonnet' })
+      const provider = pickWireProvider({ model: 'claude-opus-5' })
       expect(provider).not.toBeNull()
       await provider!.prepare?.()
 
@@ -200,12 +200,12 @@ describe('E2E Matrix Tests', () => {
     test('LLM Text Conversation', async () => {
       if (skip) test.skip('No Claude credentials found')
 
-      const provider = pickWireProvider({ model: 'claude-3-7-sonnet' })
+      const provider = pickWireProvider({ model: 'claude-opus-5' })
       expect(provider).not.toBeNull()
       const adapter = createWireAdapter(provider!)
 
       const req: AnthropicMessagesRequest = {
-        model: 'claude-3-7-sonnet',
+        model: 'claude-opus-5',
         messages: [{ role: 'user', content: 'Say hello!' }],
         max_tokens: 50,
       }

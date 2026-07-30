@@ -192,7 +192,13 @@ export function decodeResponsesToAnthropic(req: any): {
     curBlocks.push(block)
   }
 
-  const input = Array.isArray(req.input) ? req.input : []
+  // Responses 规范允许 input 为字符串简写(等价单条 user 文本)。不归一化的话
+  // 它会被当成空数组，请求到上游变成无 input → 400 missing_required_parameter。
+  const input = Array.isArray(req.input)
+    ? req.input
+    : typeof req.input === 'string' && req.input.length > 0
+      ? [req.input]
+      : []
   for (const raw of input) {
     if (typeof raw === 'string') {
       push('user', { type: 'text', text: raw })

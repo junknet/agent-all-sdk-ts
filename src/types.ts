@@ -75,3 +75,14 @@ export interface WireProvider {
   listModels?(): Promise<ModelInfo[]>
   getQuota?(): Promise<QuotaInfo>
 }
+
+export interface IngressAdapter {
+  readonly protocol: 'messages' | 'chat' | 'responses'
+  decodeRequest(rawBody: any): AnthropicMessagesRequest
+  encodeResponse(
+    upstreamResponse: Response,
+    originalRequest: any,
+    trace: string,
+    context?: any
+  ): Response | Promise<Response>
+}

@@ -31,6 +31,167 @@ export function jwtExpiry(token: string): Date | null {
   return null
 }
 
+// ── Cross-Platform Credentials Path Resolver ────────────────────────
+export function getPlatformCredentialsPath(provider: 'claude' | 'codex'): string {
+  const customDir = process.env.GATEWAY_CREDENTIALS_DIR
+  if (customDir) {
+    return provider === 'claude'
+      ? path.join(customDir, 'claude_credentials.json')
+      : path.join(customDir, 'codex_auth.json')
+  }
+
+  const home = os.homedir()
+  const isWin = process.platform === 'win32'
+  if (provider === 'claude') {
+    return path.join(home, '.claude', '.credentials.json')
+  } else {
+    if (isWin && process.env.APPDATA) {
+      return path.join(process.env.APPDATA, 'codex', 'auth.json')
+    }
+    return path.join(home, '.codex', 'auth.json')
+  }
+}
+
+// ── Memory Token Source (Centralized Cookie Management) ─────────────
+export class MemoryTokenSource implements TokenSource {
+  private provider: 'claude' | 'codex' | 'gemini'
+  private accessToken: string
+  private refreshToken?: string
+  private expiresAt: number = 0
+  private quota: QuotaInfo = {}
+
+  constructor(provider: 'claude' | 'codex' | 'gemini', accessToken: string, refreshToken?: string) {
+    this.provider = provider
+    this.accessToken = accessToken
+    this.refreshToken = refreshToken
+    const exp = jwtExpiry(accessToken)
+    if (exp) {
+      this.expiresAt = exp.getTime()
+    }
+  }
+
+  expired(): boolean {
+    if (!this.accessToken) return true
+    if (this.expiresAt === 0) return false
+    return Date.now() + 60000 > this.expiresAt
+  }
+
+  async token(): Promise<string> {
+    if (!this.expired()) {
+      return this.accessToken
+    }
+    if (!this.refreshToken) {
+      throw new Error(`memory-oauth (${this.provider}): accessToken expired and no refreshToken available`)
+    }
+    await this.refresh()
+    return this.accessToken
+  }
+
+  async refresh(): Promise<void> {
+    if (this.provider === 'claude') {
+      try {
+        await this.postRefreshClaude(CLAUDE_SCOPES)
+      } catch (err) {
+        if (err instanceof Error && err.message.includes('invalid_scope')) {
+          await this.postRefreshClaude('')
+        } else {
+          throw err
+        }
+      }
+    } else if (this.provider === 'codex') {
+      await this.postRefreshCodex()
+    }
+  }
+
+  private async postRefreshClaude(scope: string): Promise<void> {
+    const body: Record<string, string> = {
+      grant_type: 'refresh_token',
+      refresh_token: this.refreshToken!,
+      client_id: CLAUDE_CLIENT_ID,
+    }
+    if (scope) {
+      body.scope = scope
+    }
+
+    const res = await fetch(CLAUDE_TOKEN_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': CLAUDE_USER_AGENT,
+      },
+      body: JSON.stringify(body),
+    })
+
+    if (!res.ok) {
+      const errText = await res.text()
+      throw new Error(`claude-oauth refresh failed: ${res.status} ${errText}`)
+    }
+
+    const tok = (await res.json()) as any
+    if (!tok.access_token) {
+      throw new Error('claude-oauth token response missing access_token')
+    }
+
+    this.accessToken = tok.access_token
+    if (tok.refresh_token) {
+      this.refreshToken = tok.refresh_token
+    }
+    if (tok.expires_in) {
+      this.expiresAt = Date.now() + tok.expires_in * 1000
+    }
+    if (tok.scope) {
+      this.quota.tier = tok.rateLimitTier
+      this.quota.planType = tok.subscriptionType
+    }
+  }
+
+  private async postRefreshCodex(): Promise<void> {
+    const params = new URLSearchParams({
+      grant_type: 'refresh_token',
+      client_id: CODEX_CLIENT_ID,
+      refresh_token: this.refreshToken!,
+    })
+
+    const res = await fetch(CODEX_TOKEN_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: params.toString(),
+    })
+
+    if (!res.ok) {
+      const errText = await res.text()
+      throw new Error(`codex-oauth refresh failed: ${res.status} ${errText}`)
+    }
+
+    const tok = (await res.json()) as any
+    if (!tok.access_token) {
+      throw new Error('codex-oauth token response missing access_token')
+    }
+
+    this.accessToken = tok.access_token
+    if (tok.refresh_token) {
+      this.refreshToken = tok.refresh_token
+    }
+    const idToken = tok.id_token
+    if (idToken) {
+      const parts = idToken.split('.')
+      if (parts.length >= 2) {
+        try {
+          const payload = Buffer.from(parts[1]!, 'base64url').toString('utf-8')
+          const claims = JSON.parse(payload)
+          this.quota.planType = claims['https://api.openai.com/auth.gpt_plan_type'] || claims['https://api.openai.com/auth.chatgpt_plan_type']
+        } catch {}
+      }
+    }
+  }
+
+  async getQuota(): Promise<QuotaInfo> {
+    return this.quota
+  }
+}
+
 // ── Claude OAuth Source ──────────────────────────────────────────────
 const CLAUDE_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 const CLAUDE_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token'
@@ -49,7 +210,7 @@ export class ClaudeOAuthSource implements TokenSource {
   }
 
   constructor(filePath?: string) {
-    this.filePath = filePath || path.join(os.homedir(), '.claude', '.credentials.json')
+    this.filePath = filePath || getPlatformCredentialsPath('claude')
     if (!fs.existsSync(this.filePath)) {
       throw new Error(`claude-oauth: file not found at ${this.filePath}`)
     }
@@ -164,7 +325,7 @@ export class CodexOAuthSource implements TokenSource {
   }
 
   constructor(filePath?: string) {
-    this.filePath = filePath || path.join(os.homedir(), '.codex', 'auth.json')
+    this.filePath = filePath || getPlatformCredentialsPath('codex')
     if (!fs.existsSync(this.filePath)) {
       throw new Error(`codex-oauth: file not found at ${this.filePath}`)
     }
@@ -254,12 +415,27 @@ export class CodexOAuthSource implements TokenSource {
   }
 }
 
-// ── Local Credits Detector ──────────────────────────────────────────
-export function detectLocalCredits(): Credit[] {
+// ── Local/Dynamic Credits Detector ──────────────────────────────────
+export interface CustomTokens {
+  claudeAccessToken?: string
+  claudeRefreshToken?: string
+  codexAccessToken?: string
+  codexRefreshToken?: string
+  geminiAccessToken?: string
+}
+
+export function detectLocalCredits(opts?: { customTokens?: CustomTokens }): Credit[] {
   const credits: Credit[] = []
+  const ct = opts?.customTokens
 
   // --- Claude ---
-  if (process.env.ANTHROPIC_API_KEY) {
+  if (ct?.claudeAccessToken || ct?.claudeRefreshToken) {
+    const source = new MemoryTokenSource('claude', ct.claudeAccessToken || '', ct.claudeRefreshToken)
+    credits.push({ provider: 'claude', type: 'oauth', source })
+  } else if (process.env.GATEWAY_CLAUDE_ACCESS_TOKEN || process.env.GATEWAY_CLAUDE_TOKEN) {
+    const source = new MemoryTokenSource('claude', process.env.GATEWAY_CLAUDE_ACCESS_TOKEN || process.env.GATEWAY_CLAUDE_TOKEN || '', process.env.GATEWAY_CLAUDE_REFRESH_TOKEN)
+    credits.push({ provider: 'claude', type: 'oauth', source })
+  } else if (process.env.ANTHROPIC_API_KEY) {
     credits.push({ provider: 'claude', type: 'api_key', value: process.env.ANTHROPIC_API_KEY })
   } else {
     try {
@@ -269,9 +445,15 @@ export function detectLocalCredits(): Credit[] {
   }
 
   // --- Codex / OpenAI ---
-  const codexApiKey = process.env.OPENAI_API_KEY || process.env.CODEX_API_KEY
-  if (codexApiKey) {
-    credits.push({ provider: 'codex', type: 'api_key', value: codexApiKey })
+  if (ct?.codexAccessToken || ct?.codexRefreshToken) {
+    const source = new MemoryTokenSource('codex', ct.codexAccessToken || '', ct.codexRefreshToken)
+    credits.push({ provider: 'codex', type: 'oauth', source })
+  } else if (process.env.GATEWAY_CODEX_ACCESS_TOKEN || process.env.GATEWAY_CODEX_TOKEN) {
+    const source = new MemoryTokenSource('codex', process.env.GATEWAY_CODEX_ACCESS_TOKEN || process.env.GATEWAY_CODEX_TOKEN || '', process.env.GATEWAY_CODEX_REFRESH_TOKEN)
+    credits.push({ provider: 'codex', type: 'oauth', source })
+  } else if (process.env.OPENAI_API_KEY || process.env.CODEX_API_KEY) {
+    const key = process.env.OPENAI_API_KEY || process.env.CODEX_API_KEY
+    credits.push({ provider: 'codex', type: 'api_key', value: key })
   } else {
     try {
       const codexSource = new CodexOAuthSource()
@@ -284,8 +466,14 @@ export function detectLocalCredits(): Credit[] {
     } catch {}
   }
 
-  // --- Gemini direct API key ---
-  if (process.env.GOOGLE_API_KEY) {
+  // --- Gemini direct API key or OAuth Token ---
+  if (ct?.geminiAccessToken) {
+    const source = new MemoryTokenSource('gemini', ct.geminiAccessToken)
+    credits.push({ provider: 'gemini', type: 'oauth', source })
+  } else if (process.env.GATEWAY_GEMINI_ACCESS_TOKEN || process.env.GATEWAY_GEMINI_TOKEN) {
+    const source = new MemoryTokenSource('gemini', process.env.GATEWAY_GEMINI_ACCESS_TOKEN || process.env.GATEWAY_GEMINI_TOKEN || '')
+    credits.push({ provider: 'gemini', type: 'oauth', source })
+  } else if (process.env.GOOGLE_API_KEY) {
     credits.push({ provider: 'gemini', type: 'api_key', value: process.env.GOOGLE_API_KEY })
   }
 

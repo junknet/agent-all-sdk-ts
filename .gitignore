@@ -8,3 +8,4 @@ coverage.out
 Thumbs.db
 *.tmp
 *.bak
+.code-explore/

@@ -16,16 +16,22 @@ import type { AnthropicEventEmitter } from '../emitter.js'
 import { iterSSE, tryParseJSON } from '../sse.js'
 import type { TokenSource } from '../auth.js'
 
+// 实测: ChatGPT 账号(含 k12 plan)经 backend-api/codex/responses 只接受这几个通用 slug;
+// codex 专用 slug(*-codex / *-codex-max)仅对有 Codex 席位的 workspace 开放,k12 走这批会 400。
+// 与 codex CLI 的 /model 选单对齐 (2026-07-30 实测)。注意 listModels 打的
+// chatgpt.com/backend-api/codex/models 已落后于 CLI —— 它当天只回 gpt-5.4/5.5，
+// 不含任何 5.6。所以这张表不是"fallback"，是比上游 /models 更新的权威表。
 export const CODEX_MODELS = [
-  { id: 'gpt-5.2-codex', label: 'GPT-5.2 Codex', description: 'Frontier agentic coding model' },
-  { id: 'gpt-5.1-codex', label: 'GPT-5.1 Codex', description: 'Codex coding model' },
-  { id: 'gpt-5.1-codex-mini', label: 'GPT-5.1 Codex Mini', description: 'Fast Codex model' },
-  { id: 'gpt-5.1-codex-max', label: 'GPT-5.1 Codex Max', description: 'Max Codex model' },
-  { id: 'gpt-5.4', label: 'GPT-5.4', description: 'Latest GPT' },
-  { id: 'gpt-5.2', label: 'GPT-5.2', description: 'GPT-5.2' },
+  { id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', description: 'Latest frontier agentic coding model' },
+  { id: 'gpt-5.6-terra', label: 'GPT-5.6 Terra', description: 'Balanced agentic coding model for everyday work' },
+  { id: 'gpt-5.6-luna', label: 'GPT-5.6 Luna', description: 'Fast and affordable agentic coding model' },
+  { id: 'gpt-5.5', label: 'GPT-5.5', description: 'Frontier model for complex coding and research' },
+  { id: 'gpt-5.4', label: 'GPT-5.4', description: 'Strong model for everyday coding' },
+  { id: 'gpt-5.4-mini', label: 'GPT-5.4 Mini', description: 'Small, fast, cost-efficient for simpler coding' },
+  { id: 'gpt-5.3-codex-spark', label: 'GPT-5.3 Codex Spark', description: 'Ultra-fast coding model' },
 ] as const
 
-export const DEFAULT_CODEX_MODEL = 'gpt-5.2-codex'
+export const DEFAULT_CODEX_MODEL = 'gpt-5.6-sol'
 
 export function isCodexModel(model: string): boolean {
   return CODEX_MODELS.some(m => m.id === model)
@@ -34,10 +40,11 @@ export function isCodexModel(model: string): boolean {
 export function mapClaudeModelToCodex(claudeModel: string | null): string {
   if (!claudeModel) return DEFAULT_CODEX_MODEL
   if (isCodexModel(claudeModel)) return claudeModel
+  // 按能力档位对齐, 不按版本号: opus→frontier, sonnet→balanced, haiku→fast/cheap
   const lower = claudeModel.toLowerCase()
-  if (lower.includes('opus')) return 'gpt-5.1-codex-max'
-  if (lower.includes('haiku')) return 'gpt-5.1-codex-mini'
-  if (lower.includes('sonnet')) return 'gpt-5.2-codex'
+  if (lower.includes('opus')) return 'gpt-5.6-sol'
+  if (lower.includes('sonnet')) return 'gpt-5.6-terra'
+  if (lower.includes('haiku')) return 'gpt-5.6-luna'
   return DEFAULT_CODEX_MODEL
 }
 
@@ -90,7 +97,9 @@ export function createCodexProvider(opts: CodexOpts): WireProvider {
         parallel_tool_calls: true,
       }
       if (req.tools && req.tools.length > 0) body.tools = translateTools(req.tools)
-      if (req.max_tokens) body.max_output_tokens = req.max_tokens
+      // IR 的 max_tokens 在此丢弃: Codex Responses 端点现已拒收 max_output_tokens
+      // (400 "Unsupported parameter: max_output_tokens")，且无等价替代参数。
+      // 客户端传的上限对 codex 出口无效——由上游自行截断。
       if (req.thinking?.type === 'enabled' && req.thinking.budget_tokens) {
         const tokens = req.thinking.budget_tokens
         const effort = tokens <= 1024 ? 'low' : tokens <= 4096 ? 'medium' : 'high'
@@ -104,7 +113,11 @@ export function createCodexProvider(opts: CodexOpts): WireProvider {
           Accept: 'text/event-stream',
           Authorization: `Bearer ${accessToken}`,
           'chatgpt-account-id': accountId,
-          originator: 'pi',
+          // 实测: 真实 codex CLI 的 originator 是 codex_cli_rs, 后端据此放行; 用别的值会连同
+          // model 校验一起走到 400。session_id 每请求一个 uuid, 与真实 wire 对齐。
+          originator: 'codex_cli_rs',
+          'User-Agent': 'codex_cli_rs/0.58.0',
+          session_id: crypto.randomUUID(),
           'OpenAI-Beta': 'responses=experimental',
         },
         body: JSON.stringify(body),

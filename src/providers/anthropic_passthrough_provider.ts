@@ -101,7 +101,7 @@ export function createAnthropicPassthroughProvider(
       if (!res.ok) {
         // Fallback to basic list
         return [
-          { id: 'claude-3-7-sonnet', name: 'Claude 3.7 Sonnet' },
+          { id: 'claude-opus-5', name: 'Claude Opus 5' },
           { id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5' },
         ]
       }
