@@ -7,7 +7,7 @@ import { resolveModel, latestUserInput } from '../src/index.js'
 // every later request escalated). These tests pin that contract across all three protocols.
 
 const BASE = 'gemini-3.5-flash-low'         // a lower flash gear → eligible for escalation
-const HIGH = 'gemini-3-flash-agent'
+const HIGH = 'gemini-3.6-flash-high'  // 与 index.ts HIGH_GEAR 对齐(2026-07-30 升到 3.6)
 
 const resolvedFor = (body: any) => resolveModel(BASE, latestUserInput(body))
 

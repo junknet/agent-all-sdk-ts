@@ -52,9 +52,12 @@ function getGeminiTokenPath(): string {
 }
 
 const TOKEN_PATH = getGeminiTokenPath()
+// agy(Antigravity CLI 1.1.8) 打的是生产 host；daily- 那个是预发，两者模型表已不同步。
+const CC_HOST = process.env.ANTIGRAVITY_HOST ?? 'cloudcode-pa.googleapis.com'
+
 const USER_AGENT = 'antigravity/fantasy/1.0.0 linux/amd64'
 const ENDPOINT =
-  'https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse'
+  `https://${CC_HOST}/v1internal:streamGenerateContent?alt=sse`
 
 export async function getOrRefreshAccessToken(): Promise<string> {
   if (!fs.existsSync(TOKEN_PATH)) {
@@ -98,7 +101,7 @@ export async function getProject(accessToken: string): Promise<string> {
   const cached = cachedProjectsByToken.get(accessToken)
   if (cached) return cached
   const res = await fetch(
-    'https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist',
+    `https://${CC_HOST}/v1internal:loadCodeAssist`,
     {
       method: 'POST',
       headers: {
@@ -114,10 +117,17 @@ export async function getProject(accessToken: string): Promise<string> {
     throw new Error(`loadCodeAssist failed: ${res.status} ${text}`)
   }
   const data = (await res.json()) as any
-  if (!data.cloudaicompanionProject) {
-    throw new Error(`loadCodeAssist returned no cloudaicompanionProject`)
-  }
-  const project = data.cloudaicompanionProject
+  // 2026-07-30: loadCodeAssist 不再回 cloudaicompanionProject —— free-tier 被划入
+  // ineligibleTiers(UNSUPPORTED_CLIENT / UNSUPPORTED_LOCATION)，仅剩的 standard-tier
+  // 标着 userDefinedCloudaicompanionProject:true，服务端不再自动分配。
+  // Antigravity CLI 1.1.8 在同样情况下用固定串 "default-cli-project"
+  // (其日志: "Backend project ID updated dynamically to: default-cli-project")，
+  // 且 fetchAvailableModels / streamGenerateContent 实测接受它。
+  // 抛错会打死整条出口，故降级为该默认值；可用 ANTIGRAVITY_PROJECT 覆盖。
+  const project =
+    data.cloudaicompanionProject ||
+    process.env.ANTIGRAVITY_PROJECT ||
+    'default-cli-project'
   cachedProjectsByToken.set(accessToken, project)
   // Prevent memory leaks in long-running gateway processes
   if (cachedProjectsByToken.size > 2048) {
@@ -187,6 +197,8 @@ function cleanGeminiSchema(schema: any): any {
 // ── Model alias ──────────────────────────────────────────────────────
 
 export const ANTIGRAVITY_MODEL_ALIAS: Readonly<Record<string, string>> = Object.freeze({
+  // 友好名 → 具体档位。3.6 默认给 high(budget 10000)，与 agy 的 (High) 一致。
+  'gemini-3.6-flash': 'gemini-3.6-flash-high',
   'gemini-3.5-flash-high': 'gemini-3-flash-agent',
   'gemini-3.5-flash-medium': 'gemini-3.5-flash-low',
   'gemini-3.5-flash-low': 'gemini-3.5-flash-extra-low',
@@ -197,7 +209,7 @@ export const ANTIGRAVITY_MODEL_ALIAS: Readonly<Record<string, string>> = Object.
   'gemini-3.1-pro-high': 'gemini-pro-agent',
 })
 
-export const ANTIGRAVITY_DEFAULT_MODEL = 'gemini-3-flash-agent'
+export const ANTIGRAVITY_DEFAULT_MODEL = 'gemini-3.6-flash-high'
 
 export function resolveAntigravityModel(input: string | undefined): string {
   const name = (input ?? '').trim() || ANTIGRAVITY_DEFAULT_MODEL
@@ -209,9 +221,23 @@ export interface AntigravityModelMeta {
   budget: number
 }
 
+// 全表于 2026-07-30 用 cloudcode-pa 的 fetchAvailableModels 逐项核过(project=
+// "default-cli-project")。要重核: 打 :fetchAvailableModels，读每个 model 的
+// `model`(enum) 与 `thinkingBudget`。上游会改 enum —— 本次就发现
+// gemini-3-flash-agent 从 M132 漂到 M84。
 export const ANTIGRAVITY_MODEL_META: Readonly<Record<string, AntigravityModelMeta>> = Object.freeze({
+  // Gemini 3.6 Flash：当前最新档，ctx 1,048,576 / maxOut 65,536
+  'gemini-3.6-flash-high': { enum: 'MODEL_PLACEHOLDER_M71', budget: 10000 },
+  'gemini-3.6-flash-medium': { enum: 'MODEL_PLACEHOLDER_M72', budget: 4000 },
+  'gemini-3.6-flash-low': { enum: 'MODEL_PLACEHOLDER_M73', budget: 1000 },
+  // tiered = 动态思考预算(budget -1)，由上游自行分配
+  'gemini-3.6-flash-tiered': { enum: 'MODEL_PLACEHOLDER_M196', budget: -1 },
+  // 同一 CloudCode 出口也供 Anthropic(走 Vertex) 与 GPT-OSS，ctx 250k / 131k
+  'claude-sonnet-4-6': { enum: 'MODEL_PLACEHOLDER_M35', budget: 1024 },
+  'claude-opus-4-6-thinking': { enum: 'MODEL_PLACEHOLDER_M26', budget: 1024 },
+  'gpt-oss-120b-medium': { enum: 'MODEL_OPENAI_GPT_OSS_120B_MEDIUM', budget: 8192 },
   'gemini-3-flash': { enum: 'MODEL_PLACEHOLDER_M18', budget: -1 },
-  'gemini-3-flash-agent': { enum: 'MODEL_PLACEHOLDER_M132', budget: 10000 },
+  'gemini-3-flash-agent': { enum: 'MODEL_PLACEHOLDER_M84', budget: 10000 },
   'gemini-3.5-flash-low': { enum: 'MODEL_PLACEHOLDER_M20', budget: 4000 },
   'gemini-3.5-flash-extra-low': { enum: 'MODEL_PLACEHOLDER_M187', budget: 1000 },
   'gemini-3.1-pro-high': { enum: 'MODEL_PLACEHOLDER_M37', budget: 10001 },
@@ -431,7 +457,7 @@ export function createAntigravityProvider(opts: AntigravityOpts): WireProvider {
     async listModels(): Promise<ModelInfo[]> {
       const token = await getOrRefreshAccessToken()
       const proj = await getProject(token)
-      const res = await fetch('https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels', {
+      const res = await fetch(`https://${CC_HOST}/v1internal:fetchAvailableModels`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

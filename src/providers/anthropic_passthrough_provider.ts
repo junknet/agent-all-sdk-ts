@@ -26,6 +26,27 @@ export interface AnthropicPassthroughOpts {
 const OAUTH_BETA =
   'oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,context-management-2025-06-27,fine-grained-tool-streaming-2025-05-14'
 
+// OAuth(Pro/Max) 契约的第三个要件，除 Bearer 头和 ?beta=true 之外：system 的第一块
+// 必须是 Claude Code 身份串。不带它上游回的是 429 + {"type":"rate_limit_error",
+// "message":"Error"} —— 一个伪装成限流的拒绝，配额其实没动。实测(2026-07-30):
+// 同一 token、同一 model，仅加这一块就从 429 变 200。api-key 模式不需要。
+const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+
+function withClaudeCodeIdentity(
+  system: AnthropicMessagesRequest['system'],
+): AnthropicMessagesRequest['system'] {
+  const block = { type: 'text' as const, text: CLAUDE_CODE_IDENTITY }
+  if (system === undefined || system === null) return [block]
+  if (typeof system === 'string') {
+    return system.startsWith(CLAUDE_CODE_IDENTITY) ? system : [block, { type: 'text', text: system }]
+  }
+  if (!Array.isArray(system)) return [block]
+  // 已经带了就不重复插入（调用方是 Claude Code / free-code 时会自带）
+  const first = system[0] as { text?: string } | undefined
+  if (first?.text?.startsWith(CLAUDE_CODE_IDENTITY)) return system
+  return [block, ...system]
+}
+
 export function createAnthropicPassthroughProvider(
   opts: AnthropicPassthroughOpts,
 ): WireProvider {
@@ -55,7 +76,16 @@ export function createAnthropicPassthroughProvider(
     name: 'anthropic-passthrough',
 
     async buildRequest(req: AnthropicMessagesRequest): Promise<WirePreparedRequest> {
-      const body = { ...req, model: opts.model || req.model }
+      const body = {
+        ...req,
+        model: opts.model || req.model,
+        // 本 provider 的 parseStream 是纯 SSE 转发(emitRawChunk)。入口若没显式要
+        // stream，上游会回单个 JSON 对象，SSE 解析器一个事件都取不到 → 下游收到
+        // 空流(只有 message_delta + message_stop，usage 0/0)。codex/antigravity
+        // 两个 provider 都写死 stream:true，这里对齐。
+        stream: true,
+        ...(isOAuth ? { system: withClaudeCodeIdentity(req.system) } : {}),
+      }
       const key = await resolveKey()
       return {
         url: messagesUrl(),

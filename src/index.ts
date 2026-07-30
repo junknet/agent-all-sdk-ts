@@ -23,7 +23,7 @@ export interface PickProviderOpts {
 // model — claude-haiku-4-5 — for titles/summaries/小任务. Left alone it would route to the
 // real Claude Haiku backend, both costing money and contaminating a pure-gemini eval. Map
 // every haiku-class id to the cheapest gemini gear so background work runs on cheap gemini.
-const MODEL_REMAP: Array<[RegExp, string]> = [[/haiku/i, 'gemini-3.5-flash-extra-low']]
+const MODEL_REMAP: Array<[RegExp, string]> = [[/haiku/i, 'gemini-3.6-flash-low']]
 
 export function remapModel(model: string | undefined): string {
   const m = model ?? ''
@@ -35,7 +35,7 @@ export function remapModel(model: string | undefined): string {
 // (writes 「思考」/「深思」/ultrathink/think hard), bump THIS request to the high gear.
 // Default stays medium for stability+cost; the dynamic gear (gemini-3-flash, budget=-1)
 // is avoided entirely — it runs away into thinking-repetition loops.
-const HIGH_GEAR = 'gemini-3-flash-agent'
+const HIGH_GEAR = 'gemini-3.6-flash-high'
 const THINK_TRIGGER = /思考|深思|think hard|ultrathink|think harder/i
 
 export function resolveModel(
