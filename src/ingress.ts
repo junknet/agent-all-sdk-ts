@@ -15,6 +15,37 @@ function safeParseArgs(raw: unknown): Record<string, unknown> {
   }
 }
 
+// OpenAI Chat 的多模态 content 是 [{type:'text'|'image_url', …}]，Anthropic 侧是
+// [{type:'text'|'image', …}]。原实现对数组型 content 原样透传，于是客户端一粘图就
+// 400: "messages.N.content.0: Input tag 'image_url' … does not match any of the
+// expected tags"（实测 jcode 粘截图必现）。这里做块级转换。
+function convertChatContent(content: unknown): unknown {
+  if (!Array.isArray(content)) return content ?? ''
+  const out: unknown[] = []
+  for (const part of content) {
+    if (!part || typeof part !== 'object') continue
+    const p = part as any
+    if (p.type === 'text' && typeof p.text === 'string') {
+      out.push({ type: 'text', text: p.text })
+      continue
+    }
+    if (p.type === 'image_url') {
+      const url: string = typeof p.image_url === 'string' ? p.image_url : (p.image_url?.url ?? '')
+      const m = /^data:([^;]+);base64,(.*)$/s.exec(url)
+      if (m) {
+        out.push({ type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } })
+      } else if (url) {
+        // 远端 URL：Anthropic 支持 source.type='url'
+        out.push({ type: 'image', source: { type: 'url', url } })
+      }
+      continue
+    }
+    // 已经是 Anthropic 形状(text/image/tool_use/tool_result/thinking…)就原样保留
+    if (typeof p.type === 'string') out.push(p)
+  }
+  return out.length > 0 ? out : ''
+}
+
 // ── Messages Ingress Adapter (Anthropic /v1/messages) ────────────────
 export class MessagesIngressAdapter implements IngressAdapter {
   readonly protocol = 'messages'
@@ -76,7 +107,7 @@ export class ChatIngressAdapter implements IngressAdapter {
           // 归一成空串而不是原样透传，同样是为了避开上游必填校验。
           messages.push({
             role: msg.role === 'assistant' ? 'assistant' : 'user',
-            content: msg.content ?? '',
+            content: convertChatContent(msg.content),
           })
         }
       }
