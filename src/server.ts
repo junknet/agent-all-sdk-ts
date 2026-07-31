@@ -173,7 +173,12 @@ Bun.serve({
           body,
         })
 
-        const provider = pickWireProvider({ model: anthropicReq.model, customTokens })
+        const provider = pickWireProvider({
+          model: anthropicReq.model,
+          customTokens,
+          // 透传客户端声明的 beta，见 anthropic_passthrough_provider.mergeBeta
+          inboundBeta: req.headers.get('anthropic-beta') ?? undefined,
+        })
         if (!provider) {
           devlog(trace, 'error', { at: 'pickProvider', model: anthropicReq.model })
           return new Response(JSON.stringify({ error: `No provider found for model: ${anthropicReq.model}` }), {
@@ -225,7 +230,12 @@ Bun.serve({
         anthropicReq.model = resolveModel(anthropicReq.model, latestUserInput(responsesReq)).model
         const slimR = slimAnthropicRequest(anthropicReq)
         if (slimR.on) console.log(`[slim] responses: tools ${slimR.toolsBefore}→${slimR.toolsAfter}, system ${slimR.sysBefore}→${slimR.sysAfter} chars`)
-        const provider = pickWireProvider({ model: anthropicReq.model, customTokens })
+        const provider = pickWireProvider({
+          model: anthropicReq.model,
+          customTokens,
+          // 透传客户端声明的 beta，见 anthropic_passthrough_provider.mergeBeta
+          inboundBeta: req.headers.get('anthropic-beta') ?? undefined,
+        })
         if (!provider) {
           devlog(trace, 'error', { at: 'pickProvider', model: anthropicReq.model })
           return new Response(
@@ -275,7 +285,12 @@ Bun.serve({
         const slimC = slimAnthropicRequest(anthropicReq)
         if (slimC.on) console.log(`[slim] chat: tools ${slimC.toolsBefore}→${slimC.toolsAfter}, system ${slimC.sysBefore}→${slimC.sysAfter} chars`)
 
-        const provider = pickWireProvider({ model: anthropicReq.model, customTokens })
+        const provider = pickWireProvider({
+          model: anthropicReq.model,
+          customTokens,
+          // 透传客户端声明的 beta，见 anthropic_passthrough_provider.mergeBeta
+          inboundBeta: req.headers.get('anthropic-beta') ?? undefined,
+        })
         if (!provider) {
           devlog(trace, 'error', { at: 'pickProvider', model: anthropicReq.model })
           return new Response(JSON.stringify({ error: `No provider found for model: ${anthropicReq.model}` }), {

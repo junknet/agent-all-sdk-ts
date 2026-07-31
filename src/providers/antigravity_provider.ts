@@ -221,6 +221,14 @@ export interface AntigravityModelMeta {
   budget: number
 }
 
+// 上游 fetchAvailableModels 报的 maxOutputTokens：gemini 全系 65536、CloudCode 侧
+// Claude 64000。取保守的 65536 作统一上限。
+const ANTIGRAVITY_MAX_OUTPUT = 65536
+// 思考预算之外至少要留给正文的额度。CloudCode 把 thinkingBudget 算在 maxOutputTokens
+// 里，客户端给的 max_tokens 若不大于 budget，思考会把额度吃光 —— 上游返回 200 但正文
+// 为空，看起来像"模型坏了"(实测 max_tokens=20 + budget=10000 就是全空)。
+const ANTIGRAVITY_MIN_VISIBLE = 4096
+
 // 全表于 2026-07-30 用 cloudcode-pa 的 fetchAvailableModels 逐项核过(project=
 // "default-cli-project")。要重核: 打 :fetchAvailableModels，读每个 model 的
 // `model`(enum) 与 `thinkingBudget`。上游会改 enum —— 本次就发现
@@ -299,7 +307,13 @@ export function createAntigravityProvider(opts: AntigravityOpts): WireProvider {
 
       const meta = ANTIGRAVITY_MODEL_META[targetModel]
       const genCfg: Record<string, unknown> = {}
-      if (req.max_tokens) genCfg.maxOutputTokens = req.max_tokens
+      // 先按模型档位的思考预算抬高下限，再按上游上限封顶；客户端没给就直接顶满。
+      const gearBudget = meta && meta.budget > 0 ? meta.budget : 0
+      const floor = gearBudget > 0 ? gearBudget + ANTIGRAVITY_MIN_VISIBLE : 0
+      genCfg.maxOutputTokens = Math.min(
+        ANTIGRAVITY_MAX_OUTPUT,
+        Math.max(req.max_tokens ?? ANTIGRAVITY_MAX_OUTPUT, floor),
+      )
       if (typeof req.temperature === 'number') genCfg.temperature = req.temperature
       if (typeof req.top_p === 'number') genCfg.topP = req.top_p
       if (Array.isArray(req.stop_sequences)) genCfg.stopSequences = req.stop_sequences

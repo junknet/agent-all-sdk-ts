@@ -17,6 +17,8 @@ export interface PickProviderOpts {
   model?: string
   apiKey?: string
   customTokens?: CustomTokens
+  /** 入站 anthropic-beta 头，原样带给 anthropic 出口与自己的 beta 合并 */
+  inboundBeta?: string
 }
 
 // Gateway-level model remap. Clients (e.g. claude-code) use a cheap "fast/background"
@@ -146,12 +148,14 @@ export function pickWireProvider(opts: PickProviderOpts): WireProvider | null {
           apiKey: '',
           source: claudeCredit.source,
           model: opts.model ?? 'claude-opus-5',
+          inboundBeta: opts.inboundBeta,
         })
       } else if (claudeCredit.type === 'api_key' && claudeCredit.value) {
         return createAnthropicPassthroughProvider({
           baseURL: process.env.ANTHROPIC_BASE_URL ?? 'https://api.anthropic.com',
           apiKey: claudeCredit.value,
           model: opts.model ?? 'claude-opus-5',
+          inboundBeta: opts.inboundBeta,
         })
       }
     }

@@ -97,7 +97,7 @@ export class ChatIngressAdapter implements IngressAdapter {
     req.max_tokens =
       rawBody.max_tokens ??
       rawBody.max_completion_tokens ??
-      (Number.isFinite(envDefault) && envDefault > 0 ? envDefault : 32768)
+      (Number.isFinite(envDefault) && envDefault > 0 ? envDefault : 65536)
     if (typeof rawBody.temperature === 'number') req.temperature = rawBody.temperature
     if (typeof rawBody.top_p === 'number') req.top_p = rawBody.top_p
 

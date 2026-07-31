@@ -17,6 +17,8 @@ export interface AnthropicPassthroughOpts {
   apiKey: string
   model: string
   source?: TokenSource
+  /** 入站请求自带的 anthropic-beta（逗号分隔）。见 mergeBeta 的注释。 */
+  inboundBeta?: string
 }
 
 // OAuth (Claude Max/Pro) and API-key are two distinct auth modes on the Anthropic
@@ -32,13 +34,20 @@ const OAUTH_BETA =
 // 同一 token、同一 model，仅加这一块就从 429 变 200。api-key 模式不需要。
 const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
 
-// 客户端(free-code 2.1.87)会在 system 块上带 cache_control:{type:'ephemeral',scope:…}。
-// scope 属于一个本网关没有声明的 beta，而网关把 anthropic-beta 头整个换成了自己那串
-// OAUTH_BETA，客户端声明的 beta 到不了上游 → 400
-// "system.N.cache_control.ephemeral.scope: Extra inputs are not permitted"，整轮请求死。
-// 这里剥掉 scope：缓存本身仍生效，只是回到默认作用域，降级而非报错。
-// 根治要把入站 anthropic-beta 合并进 OAUTH_BETA，那需要把 header 透到 WireProvider，
-// 属于契约变更，先不做。
+// OAuth 模式下网关必须自己发 OAUTH_BETA（Bearer + claude-code 那几个 flag 是
+// 订阅鉴权的一部分），但**不能因此丢掉客户端声明的 beta** —— 客户端会带只有它自己
+// 知道要用的实验特性。曾经的症状：free-code 在 system 块上带
+// cache_control:{type:'ephemeral',scope:…}，scope 属于它声明、而网关没转发的 beta，
+// 上游 400 "cache_control.ephemeral.scope: Extra inputs are not permitted"，整轮死。
+// 早先的权宜之计是把 scope 剥掉降级；现在改为合并两侧 beta，客户端的实验特性能真正
+// 生效，也不会再被下一个新 beta 撞到。
+// 兼容垫片，与 mergeBeta 是两层不同的问题：
+//   mergeBeta 解决"客户端声明了 beta，但被网关的固定头覆盖掉"；
+//   这里解决"客户端用了新字段却根本不声明 beta"。
+// 实测 free-code 2.1.87 属于后者：走自定义 ANTHROPIC_BASE_URL 时它不发
+// anthropic-beta 头，body 里却带 system[].cache_control.ephemeral.scope，
+// 上游 400 "cache_control.ephemeral.scope: Extra inputs are not permitted"，整轮死。
+// 剥掉 scope 是降级不是报错——缓存仍生效，只是回到默认作用域。
 function stripUnsupportedCacheScope<T>(system: T): T {
   if (!Array.isArray(system)) return system
   return system.map(b => {
@@ -47,6 +56,18 @@ function stripUnsupportedCacheScope<T>(system: T): T {
     const { scope: _drop, ...rest } = cc
     return { ...(b as object), cache_control: rest }
   }) as unknown as T
+}
+
+function mergeBeta(inbound: string | undefined): string {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const part of `${OAUTH_BETA},${inbound ?? ''}`.split(',')) {
+    const v = part.trim()
+    if (!v || seen.has(v)) continue
+    seen.add(v)
+    out.push(v)
+  }
+  return out.join(',')
 }
 
 function withClaudeCodeIdentity(
@@ -76,7 +97,7 @@ export function createAnthropicPassthroughProvider(
       return {
         Authorization: `Bearer ${key}`,
         'anthropic-version': '2023-06-01',
-        'anthropic-beta': OAUTH_BETA,
+        'anthropic-beta': mergeBeta(opts.inboundBeta),
         'x-app': 'cli',
       }
     }
