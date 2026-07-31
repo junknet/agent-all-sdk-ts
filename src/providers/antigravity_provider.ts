@@ -472,7 +472,14 @@ export function createAntigravityProvider(opts: AntigravityOpts): WireProvider {
       }
       const data = (await res.json()) as any
       const models = data.models || {}
-      return Object.keys(models).map(id => ({
+      // CloudCode 的模型表里混着非面向用户的内部条目: chat_<数字> 是会话槽位、
+      // tab_* 是编辑器行内补全用的。它们没有 displayName，喂给客户端会被当成
+      // 可选模型挑走(实测 free-code 会选中 chat_20706)。这里滤掉。
+      const isInternal = (id: string, m: any): boolean =>
+        /^(chat|tab)_/.test(id) || !m?.displayName
+      return Object.keys(models)
+        .filter(id => !isInternal(id, models[id]))
+        .map(id => ({
         id: id,
         name: models[id].displayName || id,
         supportsImages: models[id].supportsImages,

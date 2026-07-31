@@ -102,6 +102,11 @@ console.log(`Starting TS Gateway Server on port ${PORT}...`)
 
 Bun.serve({
   port: PORT,
+  // Bun.serve 默认 idleTimeout 10s —— agent 请求经常在两个 SSE chunk 之间静默更久
+  // (上游思考、工具往返)，会被就地掐断，客户端看到的是
+  // "The socket connection was closed unexpectedly"，与业务无关且极难归因。
+  // 255 是 Bun 允许的上限。
+  idleTimeout: 255,
   async fetch(req) {
     const url = new URL(req.url)
 

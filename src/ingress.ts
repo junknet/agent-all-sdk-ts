@@ -2,6 +2,19 @@ import type { IngressAdapter, AnthropicMessagesRequest } from './types.js'
 import { iterSSE } from './sse.js'
 import { decodeResponsesToAnthropic, encodeAnthropicToResponsesSSE } from './responses_api.js'
 
+// OpenAI 的 tool_calls.function.arguments 是 JSON 字符串，Anthropic 的
+// tool_use.input 是对象。解析失败时兜成空对象，避免整轮请求因一个坏参数挂掉。
+function safeParseArgs(raw: unknown): Record<string, unknown> {
+  if (raw && typeof raw === 'object') return raw as Record<string, unknown>
+  if (typeof raw !== 'string' || raw.trim() === '') return {}
+  try {
+    const v = JSON.parse(raw)
+    return v && typeof v === 'object' ? (v as Record<string, unknown>) : {}
+  } catch {
+    return {}
+  }
+}
+
 // ── Messages Ingress Adapter (Anthropic /v1/messages) ────────────────
 export class MessagesIngressAdapter implements IngressAdapter {
   readonly protocol = 'messages'
@@ -28,10 +41,42 @@ export class ChatIngressAdapter implements IngressAdapter {
       for (const msg of rawBody.messages) {
         if (msg.role === 'system') {
           systemPrompt = (systemPrompt ? systemPrompt + '\n' : '') + msg.content
+        } else if (msg.role === 'tool') {
+          // OpenAI 的工具结果是一条独立的 role:"tool" 消息；Anthropic 侧它是 user
+          // 消息里的 tool_result 块，且 tool_use_id 必须与之前的 tool_use.id 对上。
+          messages.push({
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: msg.tool_call_id,
+                content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content ?? ''),
+              },
+            ],
+          })
+        } else if (msg.role === 'assistant' && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+          // 带 tool_calls 的 assistant 消息在 OpenAI 侧 content 允许为 null。原来
+          // 直接透传 content:null，上游 400 "messages.N.content: Field required"，
+          // 于是任何走 /v1/chat/completions 的多轮工具循环第二轮就死(实测 jcode)。
+          const blocks: any[] = []
+          if (typeof msg.content === 'string' && msg.content) {
+            blocks.push({ type: 'text', text: msg.content })
+          }
+          for (const tc of msg.tool_calls) {
+            blocks.push({
+              type: 'tool_use',
+              id: tc.id,
+              name: tc.function?.name,
+              input: safeParseArgs(tc.function?.arguments),
+            })
+          }
+          messages.push({ role: 'assistant', content: blocks })
         } else {
+          // content 可能是 null/undefined(极少数客户端会发空 assistant 回合)，
+          // 归一成空串而不是原样透传，同样是为了避开上游必填校验。
           messages.push({
             role: msg.role === 'assistant' ? 'assistant' : 'user',
-            content: msg.content,
+            content: msg.content ?? '',
           })
         }
       }
@@ -44,7 +89,15 @@ export class ChatIngressAdapter implements IngressAdapter {
     }
 
     if (systemPrompt) req.system = systemPrompt
-    if (rawBody.max_tokens) req.max_tokens = rawBody.max_tokens
+    // max_tokens 在 OpenAI Chat 协议里可省略，在 Anthropic Messages 里是必填 ——
+    // 省略时上游直接 400 "max_tokens: Field required"，整轮请求死(实测 jcode 的
+    // openai-compatible provider 就不发这个字段)。这里给 IR 补一个默认上限；
+    // 客户端显式给了就用客户端的。可用 AGENT_GATEWAY_DEFAULT_MAX_TOKENS 调整。
+    const envDefault = Number(process.env.AGENT_GATEWAY_DEFAULT_MAX_TOKENS)
+    req.max_tokens =
+      rawBody.max_tokens ??
+      rawBody.max_completion_tokens ??
+      (Number.isFinite(envDefault) && envDefault > 0 ? envDefault : 32768)
     if (typeof rawBody.temperature === 'number') req.temperature = rawBody.temperature
     if (typeof rawBody.top_p === 'number') req.top_p = rawBody.top_p
 

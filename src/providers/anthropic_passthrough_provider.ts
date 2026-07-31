@@ -32,6 +32,23 @@ const OAUTH_BETA =
 // 同一 token、同一 model，仅加这一块就从 429 变 200。api-key 模式不需要。
 const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
 
+// 客户端(free-code 2.1.87)会在 system 块上带 cache_control:{type:'ephemeral',scope:…}。
+// scope 属于一个本网关没有声明的 beta，而网关把 anthropic-beta 头整个换成了自己那串
+// OAUTH_BETA，客户端声明的 beta 到不了上游 → 400
+// "system.N.cache_control.ephemeral.scope: Extra inputs are not permitted"，整轮请求死。
+// 这里剥掉 scope：缓存本身仍生效，只是回到默认作用域，降级而非报错。
+// 根治要把入站 anthropic-beta 合并进 OAUTH_BETA，那需要把 header 透到 WireProvider，
+// 属于契约变更，先不做。
+function stripUnsupportedCacheScope<T>(system: T): T {
+  if (!Array.isArray(system)) return system
+  return system.map(b => {
+    const cc = (b as { cache_control?: Record<string, unknown> })?.cache_control
+    if (!cc || !('scope' in cc)) return b
+    const { scope: _drop, ...rest } = cc
+    return { ...(b as object), cache_control: rest }
+  }) as unknown as T
+}
+
 function withClaudeCodeIdentity(
   system: AnthropicMessagesRequest['system'],
 ): AnthropicMessagesRequest['system'] {
@@ -84,7 +101,9 @@ export function createAnthropicPassthroughProvider(
         // 空流(只有 message_delta + message_stop，usage 0/0)。codex/antigravity
         // 两个 provider 都写死 stream:true，这里对齐。
         stream: true,
-        ...(isOAuth ? { system: withClaudeCodeIdentity(req.system) } : {}),
+        ...(isOAuth
+          ? { system: stripUnsupportedCacheScope(withClaudeCodeIdentity(req.system)) }
+          : { system: stripUnsupportedCacheScope(req.system) }),
       }
       const key = await resolveKey()
       return {
