@@ -15,6 +15,12 @@ set -euo pipefail
 cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
 
 PORT="${AGENT_GATEWAY_PORT:-8085}"
+# 经 /v1/chat/completions 进来的客户端若不发 reasoning_effort，就按这个档位开思考。
+# jcode 的 openai-compatible provider 就属于这种(它的 openai_reasoning_effort 设置只
+# 对原生 openai 档生效)，不给默认值的话它永远拿不到思考预算，"调推理等级"是死的。
+# 想改档位: AGENT_GATEWAY_DEFAULT_EFFORT=medium ./start_gateway.sh --restart
+# 可选值 none|minimal|low|medium|high|xhigh|max，none 表示不开思考。
+export AGENT_GATEWAY_DEFAULT_EFFORT="${AGENT_GATEWAY_DEFAULT_EFFORT:-high}"
 LOG="${GATEWAY_LOG:-$HOME/.local/state/agent-all-sdk-ts/gateway.log}"
 mkdir -p "$(dirname -- "$LOG")"
 

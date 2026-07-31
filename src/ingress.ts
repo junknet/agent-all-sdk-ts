@@ -46,6 +46,28 @@ function convertChatContent(content: unknown): unknown {
   return out.length > 0 ? out : ''
 }
 
+// OpenAI 用 reasoning_effort 字符串档位，Anthropic 用 thinking.budget_tokens 数值。
+// 请求侧原先完全不接推理字段(只在响应侧回 reasoning_content)，于是任何经
+// /v1/chat/completions 的客户端都无法控制思考档位 —— 下游 harness 的"调推理等级"是死的。
+// 档位→预算的映射与 codex_provider 的反向映射保持一致(low≤1024 / medium≤4096 / high)。
+const EFFORT_BUDGET: Record<string, number> = {
+  none: 0,
+  minimal: 512,
+  low: 1024,
+  medium: 4096,
+  high: 10000,
+  xhigh: 20000,
+  max: 32000,
+}
+
+function effortToThinking(raw: unknown): { type: 'enabled'; budget_tokens: number } | undefined {
+  const key =
+    typeof raw === 'string' ? raw : typeof (raw as any)?.effort === 'string' ? (raw as any).effort : ''
+  const v = EFFORT_BUDGET[key.toLowerCase()]
+  if (v === undefined || v <= 0) return undefined
+  return { type: 'enabled', budget_tokens: v }
+}
+
 // ── Messages Ingress Adapter (Anthropic /v1/messages) ────────────────
 export class MessagesIngressAdapter implements IngressAdapter {
   readonly protocol = 'messages'
@@ -129,6 +151,13 @@ export class ChatIngressAdapter implements IngressAdapter {
       rawBody.max_tokens ??
       rawBody.max_completion_tokens ??
       (Number.isFinite(envDefault) && envDefault > 0 ? envDefault : 65536)
+    // reasoning_effort 是 OpenAI 的顶层字段；reasoning:{effort} 是 Responses 风格。
+    // 客户端没给时用 AGENT_GATEWAY_DEFAULT_EFFORT(默认不开思考，保持原行为)。
+    const think =
+      effortToThinking(rawBody.reasoning_effort) ??
+      effortToThinking(rawBody.reasoning) ??
+      effortToThinking(process.env.AGENT_GATEWAY_DEFAULT_EFFORT)
+    if (think) req.thinking = think
     if (typeof rawBody.temperature === 'number') req.temperature = rawBody.temperature
     if (typeof rawBody.top_p === 'number') req.top_p = rawBody.top_p
 
