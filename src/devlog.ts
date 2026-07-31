@@ -98,13 +98,28 @@ function sanitize(obj: unknown, depth = 0): unknown {
   return obj
 }
 
+// 单条记录上限。sanitize 只折叠了 base64 大块，request/response 的 messages 与
+// tools 仍然整体落盘 —— 实测单条最大 69KB、单日 37753 条共 990MB，且只增不减。
+// 超限时保留可检索的头部并标注截断量，诊断需要的 trace/phase/model 都在前面。
+const MAX_RECORD_BYTES = (() => {
+  const v = Number(process.env.AGENT_GATEWAY_DEVLOG_MAX_RECORD)
+  return Number.isFinite(v) && v > 0 ? v : 8192
+})()
+
 export function devlog(trace: string, phase: string, data: Record<string, unknown>): void {
   if (!ENABLED) return
   ensureDir()
   const meta = traceMeta.get(trace) ?? {}
   const record = { ts: new Date().toISOString(), trace, ...meta, phase, ...(sanitize(data) as Record<string, unknown>) }
   try {
-    appendFileSync(logFilePath(), JSON.stringify(record) + '\n')
+    let line = JSON.stringify(record)
+    if (line.length > MAX_RECORD_BYTES) {
+      const dropped = line.length - MAX_RECORD_BYTES
+      line =
+        line.slice(0, MAX_RECORD_BYTES) +
+        `…"__truncated_bytes":${dropped}}`
+    }
+    appendFileSync(logFilePath(), line + '\n')
   } catch {}
 }
 
