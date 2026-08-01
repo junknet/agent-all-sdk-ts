@@ -8,6 +8,7 @@ import { decodeResponsesToAnthropic, encodeAnthropicToResponsesSSE } from './res
 import { createAntigravityProvider, ANTIGRAVITY_DEFAULT_MODEL } from './providers/antigravity_provider.js'
 import { createCodexProvider } from './providers/codex_provider.js'
 import { createAnthropicPassthroughProvider } from './providers/anthropic_passthrough_provider.js'
+import { createOpenaiCompatProvider } from './providers/openai_compat_provider.js'
 import { detectLocalCredits } from './auth.js'
 import { slimAnthropicRequest } from './slim.js'
 import { devlog, newTrace, setTraceMeta } from './devlog.js'
@@ -50,8 +51,12 @@ const PORT = Number(process.env.AGENT_GATEWAY_PORT ?? 8085)
 // Fallback only — used if every provider's live catalog fetch fails.
 const FALLBACK_MODELS = [
   { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash' },
+  { id: 'gemini-3.6-flash-high', name: 'Gemini 3.6 Flash High' },
+  { id: 'gemini-3.6-flash-medium', name: 'Gemini 3.6 Flash Medium' },
+  { id: 'gemini-3.6-flash-low', name: 'Gemini 3.6 Flash Low' },
   { id: 'claude-opus-5', name: 'Claude Opus 5' },
   { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' },
+  { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash (DashScope)' },
 ]
 
 // listAllModels aggregates each backend's authoritative catalog (gemini via
@@ -93,6 +98,20 @@ async function listAllModels(): Promise<Array<{ id: string; name: string }>> {
     }
   } catch (e: any) {
     console.error('listModels claude failed:', e?.message ?? e)
+  }
+  // DashScope (百炼) — deepseek-v4-flash
+  if (process.env.DASHSCOPE_API_KEY) {
+    try {
+      const ds = createOpenaiCompatProvider({
+        baseURL: process.env.DASHSCOPE_BASE_URL ?? 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+        apiKey: process.env.DASHSCOPE_API_KEY,
+        model: 'deepseek-v4-flash',
+      })
+      await ds.prepare?.()
+      if (ds.listModels) out.push(...(await ds.listModels()))
+    } catch (e: any) {
+      console.error('listModels dashscope failed:', e?.message ?? e)
+    }
   }
   return out.length > 0 ? out : FALLBACK_MODELS
 }

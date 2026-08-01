@@ -35,8 +35,7 @@ export function remapModel(model: string | undefined): string {
 
 // Input-triggered gear escalation: when the user explicitly asks to think
 // (writes 「思考」/「深思」/ultrathink/think hard), bump THIS request to the high gear.
-// Default stays medium for stability+cost; the dynamic gear (gemini-3-flash, budget=-1)
-// is avoided entirely — it runs away into thinking-repetition loops.
+// Default stays medium for stability+cost.
 const HIGH_GEAR = 'gemini-3.6-flash-high'
 const THINK_TRIGGER = /思考|深思|think hard|ultrathink|think harder/i
 
@@ -46,7 +45,7 @@ export function resolveModel(
 ): { model: string; escalated: boolean } {
   const m = remapModel(model)
   // 「思考」escalation lifts a LOWER flash gear to the high flash gear. It must never
-  // touch a Pro pick (gemini-3.1-pro-*) — that's a bigger model, not a budget tier;
+  // touch a Pro pick — that's a bigger model, not a budget tier;
   // escalating it to a flash gear would be a DOWNGRADE.
   const isLowerFlashGear = /flash/i.test(m) && m !== HIGH_GEAR
   if (isLowerFlashGear && THINK_TRIGGER.test(userText)) {

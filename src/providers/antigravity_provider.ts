@@ -199,14 +199,6 @@ function cleanGeminiSchema(schema: any): any {
 export const ANTIGRAVITY_MODEL_ALIAS: Readonly<Record<string, string>> = Object.freeze({
   // 友好名 → 具体档位。3.6 默认给 high(budget 10000)，与 agy 的 (High) 一致。
   'gemini-3.6-flash': 'gemini-3.6-flash-high',
-  'gemini-3.5-flash-high': 'gemini-3-flash-agent',
-  'gemini-3.5-flash-medium': 'gemini-3.5-flash-low',
-  'gemini-3.5-flash-low': 'gemini-3.5-flash-extra-low',
-  'gemini-3.5-flash': 'gemini-3.5-flash-low',
-  // The agent endpoint only accepts the `-agent` backend ids; the friendly Pro id
-  // `gemini-3.1-pro-high` 400s (INVALID_ARGUMENT). Route it to the callable Pro agent —
-  // same enum tier (M16, budget 10001) — so codex-g-max works. Mirrors flash-high→flash-agent.
-  'gemini-3.1-pro-high': 'gemini-pro-agent',
 })
 
 export const ANTIGRAVITY_DEFAULT_MODEL = 'gemini-3.6-flash-high'
@@ -229,10 +221,9 @@ const ANTIGRAVITY_MAX_OUTPUT = 65536
 // 为空，看起来像"模型坏了"(实测 max_tokens=20 + budget=10000 就是全空)。
 const ANTIGRAVITY_MIN_VISIBLE = 4096
 
-// 全表于 2026-07-30 用 cloudcode-pa 的 fetchAvailableModels 逐项核过(project=
-// "default-cli-project")。要重核: 打 :fetchAvailableModels，读每个 model 的
-// `model`(enum) 与 `thinkingBudget`。上游会改 enum —— 本次就发现
-// gemini-3-flash-agent 从 M132 漂到 M84。
+// 全表于 2026-07-30 用 cloudcode-pa 的 fetchAvailableModels 逐项核过。
+// 只保留最新 Gemini 3.6 Flash 全系 + Pro 档位，旧版本在 2026-08-01 清理。
+// 要重核: 打 :fetchAvailableModels，读每个 model 的 `model`(enum) 与 `thinkingBudget`。
 export const ANTIGRAVITY_MODEL_META: Readonly<Record<string, AntigravityModelMeta>> = Object.freeze({
   // Gemini 3.6 Flash：当前最新档，ctx 1,048,576 / maxOut 65,536
   'gemini-3.6-flash-high': { enum: 'MODEL_PLACEHOLDER_M71', budget: 10000 },
@@ -240,28 +231,14 @@ export const ANTIGRAVITY_MODEL_META: Readonly<Record<string, AntigravityModelMet
   'gemini-3.6-flash-low': { enum: 'MODEL_PLACEHOLDER_M73', budget: 1000 },
   // tiered = 动态思考预算(budget -1)，由上游自行分配
   'gemini-3.6-flash-tiered': { enum: 'MODEL_PLACEHOLDER_M196', budget: -1 },
-  // 同一 CloudCode 出口也供 Anthropic(走 Vertex) 与 GPT-OSS，ctx 250k / 131k
-  'claude-sonnet-4-6': { enum: 'MODEL_PLACEHOLDER_M35', budget: 1024 },
-  'claude-opus-4-6-thinking': { enum: 'MODEL_PLACEHOLDER_M26', budget: 1024 },
-  'gpt-oss-120b-medium': { enum: 'MODEL_OPENAI_GPT_OSS_120B_MEDIUM', budget: 8192 },
-  'gemini-3-flash': { enum: 'MODEL_PLACEHOLDER_M18', budget: -1 },
-  'gemini-3-flash-agent': { enum: 'MODEL_PLACEHOLDER_M84', budget: 10000 },
-  'gemini-3.5-flash-low': { enum: 'MODEL_PLACEHOLDER_M20', budget: 4000 },
-  'gemini-3.5-flash-extra-low': { enum: 'MODEL_PLACEHOLDER_M187', budget: 1000 },
-  'gemini-3.1-pro-high': { enum: 'MODEL_PLACEHOLDER_M37', budget: 10001 },
-  'gemini-3.1-pro-low': { enum: 'MODEL_PLACEHOLDER_M36', budget: 1001 },
+  // Pro 档位，供 codex-g-max 等使用
   'gemini-pro-agent': { enum: 'MODEL_PLACEHOLDER_M16', budget: 10001 },
-  'gemini-2.5-pro': { enum: 'MODEL_GOOGLE_GEMINI_2_5_PRO', budget: 1024 },
 })
 
 // Models with NO reasoning capability (PROTOCOL_REFERENCE §3.1, think=✗). Sending a
 // thinkingConfig to these 400s, so the gateway strips reasoning for them regardless of
 // what the client asked — transparent compat: the client's effort param is meaningless.
-export const ANTIGRAVITY_NO_THINKING: ReadonlySet<string> = new Set([
-  'gemini-3.1-flash-lite',
-  'gemini-3.1-flash-image',
-  'gemini-2.5-flash-lite',
-])
+export const ANTIGRAVITY_NO_THINKING: ReadonlySet<string> = new Set([])
 
 function trajectoryFromRequestID(requestID: string): string {
   const parts = requestID.split('/')
