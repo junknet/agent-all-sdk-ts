@@ -9,3 +9,4 @@ Thumbs.db
 *.tmp
 *.bak
 .code-explore/
+.playwright-mcp/
