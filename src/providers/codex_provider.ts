@@ -128,6 +128,7 @@ export function createCodexProvider(opts: CodexOpts): WireProvider {
       emitter.start({ model: codexModelCache })
       let hadTools = false
       let fallbackToolCounter = 0
+      let upstreamErrorSurfaced = false
       const toolCalls = new Map<string, { order: number; id: string; name: string; arguments: string }>()
       const toolKeyByOutputIndex = new Map<number, string>()
 
@@ -181,6 +182,48 @@ export function createCodexProvider(opts: CodexOpts): WireProvider {
         const t = data.type as string
 
         switch (t) {
+          // Codex/ChatGPT rejects some requests mid-stream instead of via HTTP status —
+          // most commonly `context_length_exceeded` once the accumulated session context
+          // (agent transcript, tool outputs, images) exceeds the model's window. This
+          // surfaces as EITHER a top-level `{type:"error", error:{...}}` SSE event OR a
+          // `response.failed` event carrying `response.error`. Before this handler existed
+          // neither shape matched any case in this switch, so the loop silently skipped it
+          // and fell through to `emitter.finish()` with zero content/tool calls and
+          // stop_reason 'end_turn' — a 200-shaped response that LOOKS successful but is
+          // empty. The calling harness (omp) has no way to tell "nothing to say" from
+          // "upstream rejected this" and retries blindly until it hits its own retry cap,
+          // surfacing only "Assistant returned empty stop after retry cap" with zero
+          // indication of the real cause (verified live: 126 silent context_length_exceeded
+          // failures in one day of gateway traffic, all invisible to the caller).
+          // Fix: surface the real upstream error as visible assistant text so the harness
+          // (and the human) can see WHY and act (compact, `/shake images`, switch models) —
+          // this is a deterministic failure (the same oversized payload will fail identically
+          // on retry), so we do NOT mark the turn unusable; that would only add pointless
+          // retry latency with the exact same result.
+          case 'error': {
+            if (upstreamErrorSurfaced) break // response.failed already surfaced the same rejection
+            upstreamErrorSurfaced = true
+            const err = data.error ?? {}
+            const message = typeof err.message === 'string' && err.message
+              ? err.message
+              : 'unknown upstream error'
+            const code = typeof err.code === 'string' ? err.code : (typeof err.type === 'string' ? err.type : 'error')
+            emitter.pushText(`[gateway] Codex upstream rejected this request (${code}): ${message}`)
+            emitter.setStopReason('end_turn')
+            break
+          }
+          case 'response.failed': {
+            if (upstreamErrorSurfaced) break // top-level `error` event already surfaced this
+            upstreamErrorSurfaced = true
+            const err = data.response?.error ?? {}
+            const message = typeof err.message === 'string' && err.message
+              ? err.message
+              : 'unknown upstream error'
+            const code = typeof err.code === 'string' ? err.code : 'response.failed'
+            emitter.pushText(`[gateway] Codex upstream rejected this request (${code}): ${message}`)
+            emitter.setStopReason('end_turn')
+            break
+          }
           case 'response.output_item.added': {
             const item = data.item
             if (item?.type === 'function_call') {
