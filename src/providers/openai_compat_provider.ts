@@ -19,18 +19,31 @@ export interface OpenaiCompatOpts {
   baseURL: string
   apiKey: string
   model: string
+  /**
+   * Whether the target model can actually see image_url content. Default true
+   * (unchanged historical behaviour). Set false for text-only backends — some
+   * OpenAI-compat gateways (e.g. Alibaba DashScope compatible-mode serving a
+   * non-vision model like deepseek-v4-flash) accept `image_url` blocks in the
+   * wire schema without erroring, but the model silently can't see them: the
+   * request 200s and the model just replies "I don't see an image". Blindly
+   * embedding megabytes of base64 for a model that can't use it is pure
+   * wasted context/tokens and a confusing dead end, so when false we degrade
+   * every image block to a short text placeholder instead of image_url.
+   */
+  supportsImages?: boolean
 }
 
 export function createOpenaiCompatProvider(opts: OpenaiCompatOpts): WireProvider {
   const targetModel =
     process.env.OPENAI_MODEL || process.env.OPENAI_COMPAT_MODEL || opts.model || 'gpt-4o'
+  const supportsImages = opts.supportsImages ?? true
 
   return {
     name: 'openai-compat',
 
     async buildRequest(req: AnthropicMessagesRequest): Promise<WirePreparedRequest> {
       const systemText = systemPromptToString(req.system)
-      const messages = translateMessages(req.messages, systemText)
+      const messages = translateMessages(req.messages, systemText, supportsImages)
 
       const body: Record<string, unknown> = {
         model: targetModel,
@@ -250,9 +263,16 @@ function translateTools(tools: AnthropicTool[]): Array<Record<string, unknown>> 
   }))
 }
 
+// Placeholder dropped in place of an image block when the target model has no vision
+// capability, so the turn still reads coherently instead of silently vanishing. Leading
+// newline keeps it visually separated when concatenated after preceding text (textParts
+// are joined with '' to match this file's existing multi-text-block behaviour).
+const IMAGE_UNSUPPORTED_PLACEHOLDER = '\n[image omitted: this model does not support image input]'
+
 function translateMessages(
   messages: AnthropicMessage[],
   systemPrompt: string,
+  supportsImages: boolean,
 ): Array<Record<string, unknown>> {
   const out: Array<Record<string, unknown>> = []
   if (systemPrompt) out.push({ role: 'system', content: systemPrompt })
@@ -275,6 +295,10 @@ function translateMessages(
       if (block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) {
         textParts.push(block.text)
       } else if (block.type === 'image' && block.source && block.source.type === 'base64') {
+        if (!supportsImages) {
+          textParts.push(IMAGE_UNSUPPORTED_PLACEHOLDER)
+          continue
+        }
         hasImage = true
         contentParts.push({
           type: 'image_url',
@@ -301,12 +325,16 @@ function translateMessages(
             .map(b => b.text as string)
           let joinedText = parts.join('')
 
-          const imageParts = (block.content as AnthropicContentBlock[])
-            .filter(b => b.type === 'image' && b.source && b.source.type === 'base64')
-            .map(b => {
-              const src = b.source as any
-              return `\n![image](data:${src.media_type};base64,${src.data})`
-            })
+          const imageParts = supportsImages
+            ? (block.content as AnthropicContentBlock[])
+                .filter(b => b.type === 'image' && b.source && b.source.type === 'base64')
+                .map(b => {
+                  const src = b.source as any
+                  return `\n![image](data:${src.media_type};base64,${src.data})`
+                })
+            : (block.content as AnthropicContentBlock[])
+                .filter(b => b.type === 'image' && b.source && b.source.type === 'base64')
+                .map(() => IMAGE_UNSUPPORTED_PLACEHOLDER)
           toolContent = joinedText + imageParts.join('')
           if (toolContent.length === 0) {
             toolContent = JSON.stringify(block.content)

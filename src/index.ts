@@ -138,6 +138,30 @@ export function pickWireProvider(opts: PickProviderOpts): WireProvider | null {
     })
   }
 
+  // 2.4 百炼 (Alibaba Bailian / DashScope) — deepseek-v4-flash ONLY, and checked on an
+  // EXPLICIT model-id match ahead of the Claude/Codex credential-presence branches below.
+  // Those branches route any unmatched model to whatever credential happens to be locally
+  // configured (e.g. any model name falls through to Codex if a ChatGPT session exists) —
+  // that's fine for them, but wrong here: this route must claim deepseek-v4-flash and
+  // ONLY deepseek-v4-flash, never let another provider silently absorb it and never let
+  // this route silently absorb another model ("其他都不要进来污染"). DASHSCOPE_MODEL can
+  // override the exact deployed id (DashScope reserves the right to rev dates, e.g.
+  // -0731), but the match stays anchored to the deepseek-v4-flash family.
+  const BAILIAN_MODEL_RE = /^deepseek-v4-flash/i
+  if (BAILIAN_MODEL_RE.test(modelLower)) {
+    return createOpenaiCompatProvider({
+      baseURL: process.env.DASHSCOPE_BASE_URL ?? 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+      apiKey: process.env.DASHSCOPE_API_KEY ?? opts.apiKey ?? '',
+      model: process.env.DASHSCOPE_MODEL ?? opts.model ?? 'deepseek-v4-flash-0731',
+      // deepseek-v4-flash accepts image_url in the request schema without erroring, but the
+      // model has no vision capability — it silently ignores the image and replies "I don't
+      // see an image" (verified live against the DashScope compat endpoint). Gate images off
+      // so the provider degrades them to a text placeholder instead of wasting tokens on
+      // base64 the model can't use.
+      supportsImages: false,
+    })
+  }
+
   // 2.5 Claude (Anthropic API / OAuth)
   if (modelLower.includes('claude') || process.env.ANTHROPIC_API_KEY) {
     const claudeCredit = credits.find(c => c.provider === 'claude')

@@ -56,6 +56,13 @@ src/
 - **Gemini thoughtSignature 缓存**（`antigravity_provider.ts`）：Gemini 多轮推理依赖每个 functionCall 的
   `thoughtSignature`，但它无法穿过 codex/openai 往返。网关按 `call_id` 服务端缓存真签名、replay 时贴回，
   替掉 `skip_thought_signature_validator` 占位——否则跨轮推理链断裂会导致重复规划 / MALFORMED / 400。
+- **百炼 (Bailian/DashScope) 出口**：模型 id 精确匹配 `deepseek-v4-flash*` 才路由到
+  `https://dashscope.aliyuncs.com/compatible-mode/v1`（`DASHSCOPE_API_KEY` / `DASHSCOPE_BASE_URL` /
+  `DASHSCOPE_MODEL` 可覆盖），且检查位置在所有凭据型分支（Claude/Codex）**之前**——避免被本地凭据
+  "顺手"接管，也避免其他模型误落进这条出口（按用户要求，仅此一个模型，不允许其他模型污染这条路由）。
+  该模型的 wire schema 接受 `image_url` 但模型本身**无视觉能力**（实测：200 返回但模型答"看不到图片"），
+  故 provider 以 `supportsImages:false` 构造，图片块在 `openai_compat_provider.ts` 侧统一降级为文字占位
+  `[image omitted: this model does not support image input]`，不再把大段 base64 塞进纯文本模型的上下文。
 
 ## 运行 / 验收
 
