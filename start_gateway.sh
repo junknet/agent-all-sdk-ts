@@ -14,6 +14,21 @@ set -euo pipefail
 
 cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
 
+# Bun loads repository-local .env files into test processes, so gateway credentials
+# live outside the worktree. Load the owner-only runtime file explicitly so every
+# restart uses the selected egress rather than an inherited shell's provider settings.
+ENV_FILE="${AGENT_GATEWAY_ENV_FILE:-$HOME/.config/agent-all-sdk-ts/cc-relay.env}"
+if [[ -f "$ENV_FILE" ]]; then
+  [[ "$(stat -c '%a' -- "$ENV_FILE")" == "600" ]] || {
+    echo "[fail] $ENV_FILE must have mode 0600" >&2
+    exit 1
+  }
+  set -a
+  # shellcheck source=/dev/null
+  source "$ENV_FILE"
+  set +a
+fi
+
 PORT="${AGENT_GATEWAY_PORT:-8085}"
 # 经 /v1/chat/completions 进来的客户端若不发 reasoning_effort，就按这个档位开思考。
 # jcode 的 openai-compatible provider 就属于这种(它的 openai_reasoning_effort 设置只
@@ -66,9 +81,12 @@ if [[ -z "${DASHSCOPE_API_KEY:-}" && -r "$DASHSCOPE_KEY_FILE" ]]; then
   export DASHSCOPE_API_KEY="$(<"$DASHSCOPE_KEY_FILE")"
 fi
 
-# 调用方显式传了 OPENAI_API_KEY 就尊重它, 否则清掉(见上文 why 2)
+# 调用方显式传了 OPENAI_API_KEY 就尊重它, 否则清掉(见上文 why 2)。单后端
+# OpenAI-compatible 模式的 key 正是该出口的配置，不应被这条 Codex 保护误删。
 KEY_UNSET=()
-[[ -z "${OPENAI_API_KEY_EXPLICIT:-}" ]] && KEY_UNSET=(-u OPENAI_API_KEY)
+if [[ -z "${OPENAI_API_KEY_EXPLICIT:-}" && ! "${FORCE_OPENAI_COMPAT:-}" =~ ^(1|true|yes)$ ]]; then
+  KEY_UNSET=(-u OPENAI_API_KEY)
+fi
 
 # 显式下发端口: 脚本管的是 $PORT 这一个实例，子进程必须绑同一个端口，不能靠调用方
 # 环境里碰巧有没有 AGENT_GATEWAY_PORT。

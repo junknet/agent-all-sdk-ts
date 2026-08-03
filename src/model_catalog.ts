@@ -8,7 +8,9 @@ import {
   resolveAntigravityModel,
 } from './providers/antigravity_provider.js'
 import { createCodexProvider } from './providers/codex_provider.js'
+import { createOpenaiCompatProvider } from './providers/openai_compat_provider.js'
 import type { ModelInfo, ThinkingEffort } from './types.js'
+import { isCcRelayProtocolAware, listCcRelayModels } from './cc_relay.js'
 
 type CatalogSource = 'antigravity' | 'codex' | 'claude'
 
@@ -39,10 +41,10 @@ export interface GatewayModelObject {
   readonly owned_by: 'local-gw'
   readonly name: string
   readonly supported_endpoint_types: readonly ['anthropic', 'openai']
-  readonly context_length: number
-  readonly context_window: number
-  readonly max_input_tokens: number
-  readonly max_output_tokens: number
+  readonly context_length?: number
+  readonly context_window?: number
+  readonly max_input_tokens?: number
+  readonly max_output_tokens?: number
   readonly capabilities: GatewayModelCapabilities
 }
 
@@ -212,6 +214,24 @@ async function isolateCatalog(
 
 /** Query independent provider catalogs concurrently, then apply gateway policy. */
 export async function listAvailableModels(): Promise<ModelInfo[]> {
+  if (isCcRelayProtocolAware()) {
+    return [...await listCcRelayModels()]
+  }
+  if (process.env.FORCE_OPENAI_COMPAT === '1') {
+    const provider = createOpenaiCompatProvider({
+      baseURL: process.env.OPENAI_BASE_URL ?? '',
+      apiKey: process.env.OPENAI_API_KEY ?? '',
+      model: '',
+      authScheme: process.env.OPENAI_COMPAT_AUTH_SCHEME === 'x-api-key' ? 'x-api-key' : 'bearer',
+    })
+    const models = (await provider.listModels?.()) ?? []
+    // A generic forced egress only speaks Chat Completions, so do not advertise
+    // models whose upstream admission requires Messages or Responses.
+    return models.filter(model =>
+      model.clientProtocol === undefined || model.clientProtocol === 'openai_chat_completions',
+    )
+  }
+
   const credits = detectLocalCredits()
   const codexCredit = credits.find(credit => credit.provider === 'codex')
   const claudeCredit = credits.find(credit => credit.provider === 'claude')
@@ -261,18 +281,30 @@ export function createModelsListResponse(models: readonly ModelInfo[]): GatewayM
     }
     seen.add(model.id)
     const thinking = model.supportsThinking ?? false
+    const contextWindow =
+      typeof model.contextWindow === 'number' && Number.isFinite(model.contextWindow)
+        ? positive(model.contextWindow, 'contextWindow', model.id)
+        : undefined
+    const maxOutputTokens =
+      typeof model.maxOutputTokens === 'number' && Number.isFinite(model.maxOutputTokens)
+        ? positive(model.maxOutputTokens, 'maxOutputTokens', model.id)
+        : undefined
     return {
       id: model.id,
       object: 'model' as const,
       created: 0 as const,
       owned_by: 'local-gw' as const,
       // Deliberately exact: the selector shown to a user is also the routed id.
-      name: model.id,
+      name: model.name,
       supported_endpoint_types: ['anthropic', 'openai'] as const,
-      context_length: positive(model.contextWindow, 'contextWindow', model.id),
-      context_window: positive(model.contextWindow, 'contextWindow', model.id),
-      max_input_tokens: positive(model.contextWindow, 'contextWindow', model.id),
-      max_output_tokens: positive(model.maxOutputTokens, 'maxOutputTokens', model.id),
+      ...(contextWindow
+        ? {
+            context_length: contextWindow,
+            context_window: contextWindow,
+            max_input_tokens: contextWindow,
+          }
+        : {}),
+      ...(maxOutputTokens ? { max_output_tokens: maxOutputTokens } : {}),
       capabilities: {
         inputModalities: model.supportsImages ? (['text', 'image'] as const) : (['text'] as const),
         tools: model.supportsTools ?? true,

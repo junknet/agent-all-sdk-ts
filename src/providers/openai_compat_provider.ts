@@ -10,6 +10,7 @@ import type {
   WireProvider,
   WirePreparedRequest,
   ModelInfo,
+  ClientProtocol,
   QuotaInfo,
 } from '../types.js'
 import { toCodexEffort } from '../thinking.js'
@@ -40,6 +41,8 @@ export interface OpenaiCompatOpts {
   baseURL: string
   apiKey: string
   model: string
+  /** Authentication form required by the compatible endpoint. */
+  authScheme?: 'bearer' | 'x-api-key'
   /**
    * Whether the target model can actually see image_url content. Default true
    * (unchanged historical behaviour). Set false for text-only backends — some
@@ -57,11 +60,26 @@ export interface OpenaiCompatOpts {
   supportsImages?: boolean
 }
 
+function parseClientProtocol(value: unknown): ClientProtocol | undefined {
+  if (
+    value === 'anthropic_messages' ||
+    value === 'openai_chat_completions' ||
+    value === 'openai_responses'
+  ) {
+    return value
+  }
+  return undefined
+}
+
 export function createOpenaiCompatProvider(opts: OpenaiCompatOpts): WireProvider {
   const targetModel = opts.ignoreEnvironmentModel
     ? opts.model || 'gpt-4o'
     : process.env.OPENAI_MODEL || process.env.OPENAI_COMPAT_MODEL || opts.model || 'gpt-4o'
   const supportsImages = opts.supportsImages ?? true
+  const authHeaders =
+    opts.authScheme === 'x-api-key'
+      ? { 'x-api-key': opts.apiKey }
+      : { Authorization: `Bearer ${opts.apiKey}` }
 
   return {
     name: 'openai-compat',
@@ -109,7 +127,7 @@ export function createOpenaiCompatProvider(opts: OpenaiCompatOpts): WireProvider
         url: `${opts.baseURL.replace(/\/$/, '')}/chat/completions`,
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${opts.apiKey}`,
+          ...authHeaders,
         },
         body: bodyStr,
       }
@@ -238,7 +256,7 @@ export function createOpenaiCompatProvider(opts: OpenaiCompatOpts): WireProvider
       const res = await fetch(`${opts.baseURL.replace(/\/$/, '')}/models`, {
         method: 'GET',
         headers: {
-          'Authorization': `Bearer ${opts.apiKey}`,
+          ...authHeaders,
         },
       })
       if (!res.ok) {
@@ -248,7 +266,10 @@ export function createOpenaiCompatProvider(opts: OpenaiCompatOpts): WireProvider
       const list = data.data || []
       return list.map((m: any) => ({
         id: m.id,
-        name: m.id,
+        name: m.display_name || m.id,
+        ...(parseClientProtocol(m.client_protocol)
+          ? { clientProtocol: parseClientProtocol(m.client_protocol) }
+          : {}),
       }))
     },
 

@@ -13,6 +13,11 @@ import { createAntigravityProvider, ANTIGRAVITY_DEFAULT_MODEL } from './provider
 import { createAnthropicPassthroughProvider } from './providers/anthropic_passthrough_provider.js'
 import { resolveDeepSeekRoute, hasDeepSeekPlatformPrefix } from './deepseek_routes.js'
 import { detectLocalCredits, type CustomTokens } from './auth.js'
+import {
+  ccRelayConfig,
+  ccRelayProtocolForModel,
+  isCcRelayProtocolAware,
+} from './cc_relay.js'
 
 export interface PickProviderOpts {
   model?: string
@@ -44,6 +49,9 @@ export function resolveModel(
   model: string | undefined,
   userText: string,
 ): { model: string; escalated: boolean } {
+  // Protocol-aware cc-relay publishes the exact public model ids.  Rewriting a
+  // selected id would make its catalog-derived protocol lookup incorrect.
+  if (isCcRelayProtocolAware()) return { model: model ?? '', escalated: false }
   const m = remapModel(model)
   // 「思考」escalation lifts a LOWER flash gear to the high flash gear. It must never
   // touch a Pro pick — that's a bigger model, not a budget tier;
@@ -54,6 +62,43 @@ export function resolveModel(
     return { model: HIGH_GEAR, escalated: true }
   }
   return { model: m, escalated: false }
+}
+
+/**
+ * Protocol-aware cc-relay selection.  The relay catalog is queried instead of
+ * maintaining a local model-family list, so new published models inherit their
+ * declared egress protocol without a gateway release.
+ */
+export async function pickCcRelayWireProvider(opts: PickProviderOpts): Promise<WireProvider | null> {
+  if (!isCcRelayProtocolAware()) return null
+  const model = opts.model ?? ''
+  if (!model) throw new Error('cc-relay requests require a model')
+  const { baseURL, apiKey } = ccRelayConfig()
+  const protocol = await ccRelayProtocolForModel(model)
+
+  if (protocol === 'anthropic_messages') {
+    return createAnthropicPassthroughProvider({
+      baseURL,
+      apiKey,
+      model,
+      inboundBeta: opts.inboundBeta,
+    })
+  }
+  if (protocol === 'openai_chat_completions') {
+    return createOpenaiCompatProvider({
+      baseURL: `${baseURL}/v1`,
+      apiKey,
+      model,
+      authScheme: 'x-api-key',
+      ignoreEnvironmentModel: true,
+    })
+  }
+  return createCodexProvider({
+    responsesBaseURL: `${baseURL}/v1`,
+    apiKey,
+    model,
+    authScheme: 'x-api-key',
+  })
 }
 
 // Extract ONLY the latest human-authored user turn from an inbound request (any protocol),
@@ -113,10 +158,15 @@ export function pickWireProvider(opts: PickProviderOpts): WireProvider | null {
   //    分流 / gemini 评测路由 / 本地凭据探测。用于「三协议统一入口 → 单一模型」部署，
   //    任何入口协议、任何 model 名都落到同一后端；实际 model 由 OPENAI_MODEL 固定。
   if (truthy(process.env.FORCE_OPENAI_COMPAT)) {
+    const preserveRequestedModel = truthy(process.env.FORCE_OPENAI_COMPAT_PRESERVE_REQUESTED_MODEL)
     return createOpenaiCompatProvider({
       baseURL: process.env.OPENAI_BASE_URL ?? '',
       apiKey: process.env.OPENAI_API_KEY ?? opts.apiKey ?? '',
-      model: process.env.OPENAI_MODEL ?? process.env.OPENAI_COMPAT_MODEL ?? opts.model ?? '',
+      model: preserveRequestedModel
+        ? opts.model ?? ''
+        : process.env.OPENAI_MODEL ?? process.env.OPENAI_COMPAT_MODEL ?? opts.model ?? '',
+      authScheme: process.env.OPENAI_COMPAT_AUTH_SCHEME === 'x-api-key' ? 'x-api-key' : 'bearer',
+      ignoreEnvironmentModel: preserveRequestedModel,
     })
   }
 

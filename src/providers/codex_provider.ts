@@ -65,17 +65,24 @@ const CODEX_ENDPOINT = 'https://chatgpt.com/backend-api/codex/responses'
 export interface CodexOpts {
   accessToken?: string
   source?: TokenSource
+  /** Standard OpenAI Responses endpoint, used without ChatGPT account headers. */
+  responsesBaseURL?: string
+  apiKey?: string
+  model?: string
+  authScheme?: 'bearer' | 'x-api-key'
 }
 
 export function createCodexProvider(opts: CodexOpts): WireProvider {
   let accessToken = opts.accessToken || ''
   let accountId = ''
   let codexModelCache = DEFAULT_CODEX_MODEL
+  const responsesCompat = typeof opts.responsesBaseURL === 'string' && opts.responsesBaseURL.length > 0
 
   return {
     name: 'codex',
 
     async prepare(): Promise<void> {
+      if (responsesCompat) return
       if (opts.source) {
         accessToken = await opts.source.token()
       }
@@ -83,10 +90,14 @@ export function createCodexProvider(opts: CodexOpts): WireProvider {
     },
 
     async buildRequest(req: AnthropicMessagesRequest): Promise<WirePreparedRequest> {
-      const codexModel = mapClaudeModelToCodex(req.model ?? null)
+      const codexModel = responsesCompat
+        ? opts.model ?? req.model ?? DEFAULT_CODEX_MODEL
+        : mapClaudeModelToCodex(req.model ?? null)
       codexModelCache = codexModel
       const instructions = systemPromptToString(req.system)
-      const input = translateMessages(req.messages)
+      const input = responsesCompat
+        ? translateMessagesForResponses(req.messages)
+        : translateMessages(req.messages)
 
       const body: Record<string, unknown> = {
         model: codexModel,
@@ -106,19 +117,29 @@ export function createCodexProvider(opts: CodexOpts): WireProvider {
       if (req.serviceTier?.tier === 'priority') body.service_tier = 'priority'
 
       return {
-        url: CODEX_ENDPOINT,
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'text/event-stream',
-          Authorization: `Bearer ${accessToken}`,
-          'chatgpt-account-id': accountId,
-          // 实测: 真实 codex CLI 的 originator 是 codex_cli_rs, 后端据此放行; 用别的值会连同
-          // model 校验一起走到 400。session_id 每请求一个 uuid, 与真实 wire 对齐。
-          originator: 'codex_cli_rs',
-          'User-Agent': 'codex_cli_rs/0.58.0',
-          session_id: crypto.randomUUID(),
-          'OpenAI-Beta': 'responses=experimental',
-        },
+        url: responsesCompat
+          ? `${opts.responsesBaseURL!.replace(/\/$/, '')}/responses`
+          : CODEX_ENDPOINT,
+        headers: responsesCompat
+          ? {
+              'Content-Type': 'application/json',
+              Accept: 'text/event-stream',
+              ...(opts.authScheme === 'x-api-key'
+                ? { 'x-api-key': opts.apiKey ?? '' }
+                : { Authorization: `Bearer ${opts.apiKey ?? ''}` }),
+            }
+          : {
+              'Content-Type': 'application/json',
+              Accept: 'text/event-stream',
+              Authorization: `Bearer ${accessToken}`,
+              'chatgpt-account-id': accountId,
+              // 实测: 真实 codex CLI 的 originator 是 codex_cli_rs, 后端据此放行; 用别的值会连同
+              // model 校验一起走到 400。session_id 每请求一个 uuid, 与真实 wire 对齐。
+              originator: 'codex_cli_rs',
+              'User-Agent': 'codex_cli_rs/0.58.0',
+              session_id: crypto.randomUUID(),
+              'OpenAI-Beta': 'responses=experimental',
+            },
         body: JSON.stringify(body),
       }
     },
@@ -330,6 +351,7 @@ export function createCodexProvider(opts: CodexOpts): WireProvider {
     },
 
     async listModels(): Promise<ModelInfo[]> {
+      if (responsesCompat) return []
       const res = await fetch('https://chatgpt.com/backend-api/codex/models', {
         method: 'GET',
         headers: {
@@ -473,4 +495,28 @@ function translateMessages(
   }
 
   return out
+}
+
+/**
+ * ChatGPT's private Codex endpoint accepts shorthand `{role, content}` input
+ * items.  Public Responses-compatible relays validate the documented envelope
+ * and require every message item to carry `type: "message"`.
+ */
+function translateMessagesForResponses(
+  messages: AnthropicMessage[],
+): Array<Record<string, unknown>> {
+  return translateMessages(messages).map(item => {
+    if (typeof item.type === 'string') return item
+    const role = item.role
+    if (role !== 'user' && role !== 'assistant' && role !== 'system') return item
+    const content = item.content
+    if (typeof content === 'string') {
+      return {
+        type: 'message',
+        role,
+        content: [{ type: role === 'assistant' ? 'output_text' : 'input_text', text: content }],
+      }
+    }
+    return { type: 'message', role, content }
+  })
 }

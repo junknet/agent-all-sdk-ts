@@ -2,7 +2,7 @@
  * Agent Gateway HTTP server implemented using Bun.serve
  */
 
-import { pickWireProvider, createWireAdapter, resolveModel, latestUserInput } from './index.js'
+import { pickCcRelayWireProvider, pickWireProvider, createWireAdapter, resolveModel, latestUserInput } from './index.js'
 import { pickIngressAdapter } from './ingress.js'
 import { decodeResponsesToAnthropic, encodeAnthropicToResponsesSSE } from './responses_api.js'
 import { createModelsListResponse, listAvailableModels } from './model_catalog.js'
@@ -119,10 +119,14 @@ Bun.serve({
           body,
         })
 
-        const provider = pickWireProvider({
+        const provider = await pickCcRelayWireProvider({
           model: anthropicReq.model,
           customTokens,
           // 透传客户端声明的 beta，见 anthropic_passthrough_provider.mergeBeta
+          inboundBeta: req.headers.get('anthropic-beta') ?? undefined,
+        }) ?? pickWireProvider({
+          model: anthropicReq.model,
+          customTokens,
           inboundBeta: req.headers.get('anthropic-beta') ?? undefined,
         })
         if (!provider) {
@@ -176,10 +180,14 @@ Bun.serve({
         anthropicReq.model = resolveModel(anthropicReq.model, latestUserInput(responsesReq)).model
         const slimR = slimAnthropicRequest(anthropicReq)
         if (slimR.on) console.log(`[slim] responses: tools ${slimR.toolsBefore}→${slimR.toolsAfter}, system ${slimR.sysBefore}→${slimR.sysAfter} chars`)
-        const provider = pickWireProvider({
+        const provider = await pickCcRelayWireProvider({
           model: anthropicReq.model,
           customTokens,
           // 透传客户端声明的 beta，见 anthropic_passthrough_provider.mergeBeta
+          inboundBeta: req.headers.get('anthropic-beta') ?? undefined,
+        }) ?? pickWireProvider({
+          model: anthropicReq.model,
+          customTokens,
           inboundBeta: req.headers.get('anthropic-beta') ?? undefined,
         })
         if (!provider) {
@@ -231,10 +239,14 @@ Bun.serve({
         const slimC = slimAnthropicRequest(anthropicReq)
         if (slimC.on) console.log(`[slim] chat: tools ${slimC.toolsBefore}→${slimC.toolsAfter}, system ${slimC.sysBefore}→${slimC.sysAfter} chars`)
 
-        const provider = pickWireProvider({
+        const provider = await pickCcRelayWireProvider({
           model: anthropicReq.model,
           customTokens,
           // 透传客户端声明的 beta，见 anthropic_passthrough_provider.mergeBeta
+          inboundBeta: req.headers.get('anthropic-beta') ?? undefined,
+        }) ?? pickWireProvider({
+          model: anthropicReq.model,
+          customTokens,
           inboundBeta: req.headers.get('anthropic-beta') ?? undefined,
         })
         if (!provider) {

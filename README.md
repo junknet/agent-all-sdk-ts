@@ -107,6 +107,24 @@ bun run src/server.ts          # 默认 :8085（AGENT_GATEWAY_PORT 可改）
 bun test                       # wire 契约 + 升档状态机 + 签名 lockstep + E2E（有凭据才跑对应后端）
 ```
 
+若 cc-relay 的 `/v1/models` 为每个模型给出 `client_protocol`，可让三种入口按模型转换为
+对应的真实出站协议（Messages / Chat Completions / Responses）。将仅本机可读的
+`~/.config/agent-all-sdk-ts/cc-relay.env` 设为 `0600`，再用 `./start_gateway.sh --restart`：
+
+```bash
+ANTHROPIC_BASE_URL=https://<relay>
+ANTHROPIC_API_KEY=<client-api-key>
+CC_RELAY_PROTOCOL_AWARE=1
+```
+
+启动器会显式加载该文件；它不在仓库内，也不会污染 `bun test`。该模式以 `x-api-key`
+读取中转模型目录，并按目录声明出站：`anthropic_messages` → `/v1/messages`，
+`openai_chat_completions` → `/v1/chat/completions`，`openai_responses` → `/v1/responses`。
+模型名称保持客户端选择的原值；未在目录发布或未声明协议的模型会明确拒绝，不猜测路由。
+
+若后端只有一个 Chat Completions 出口，仍可使用旧的 `FORCE_OPENAI_COMPAT=1` 配置；它只会
+发布 Chat 协议模型，不具备上述三协议模型转换能力。
+
 后端按「请求 model id + 本地凭据 + `CLAUDE_CODE_USE_*` 开关」自动选择；DeepSeek 的平台
 由 model 前缀决定。凭据来源见 `auth.ts`（`~/.claude/.credentials.json` /
 `~/.codex/auth.json` / `~/.gemini/oauth_creds.json` / 各 `*_API_KEY`）。

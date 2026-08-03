@@ -4,6 +4,8 @@ import { createCodexProvider } from '../src/providers/codex_provider.js'
 import { createOpenaiCompatProvider } from '../src/providers/openai_compat_provider.js'
 import { toolResultToResponse } from '../src/providers/antigravity_provider.js'
 import { createAntigravityProvider } from '../src/providers/antigravity_provider.js'
+import { pickWireProvider } from '../src/index.js'
+import { createCodexProvider } from '../src/providers/codex_provider.js'
 
 function sseData(payload: unknown): string {
   return `data: ${JSON.stringify(payload)}\n\n`
@@ -183,6 +185,87 @@ test('openai-compat translates user message images to content array', async () =
       ],
     },
   ])
+})
+
+test('openai-compat uses x-api-key when the compatible endpoint requires it', async () => {
+  const provider = createOpenaiCompatProvider({
+    baseURL: 'https://example.invalid/v1',
+    apiKey: 'test-key',
+    model: 'kimi-k3',
+    authScheme: 'x-api-key',
+  })
+
+  const request = await provider.buildRequest({
+    messages: [{ role: 'user', content: 'hello' }],
+  })
+
+  expect(request.headers).toEqual({
+    'Content-Type': 'application/json',
+    'x-api-key': 'test-key',
+  })
+})
+
+test('responses compatibility provider preserves the published model and x-api-key auth', async () => {
+  const provider = createCodexProvider({
+    responsesBaseURL: 'https://example.invalid/v1',
+    apiKey: 'test-key',
+    model: 'gpt-5-4',
+    authScheme: 'x-api-key',
+  })
+
+  const request = await provider.buildRequest({
+    model: 'gpt-5-4',
+    messages: [{ role: 'user', content: 'hello' }],
+  })
+
+  expect(request.url).toBe('https://example.invalid/v1/responses')
+  expect(request.headers).toEqual({
+    'Content-Type': 'application/json',
+    Accept: 'text/event-stream',
+    'x-api-key': 'test-key',
+  })
+  expect(JSON.parse(request.body)).toMatchObject({
+    model: 'gpt-5-4',
+    input: [{
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: 'hello' }],
+    }],
+  })
+})
+
+test('forced compatible multi-model mode preserves the selected model', async () => {
+  const names = [
+    'FORCE_OPENAI_COMPAT',
+    'FORCE_OPENAI_COMPAT_PRESERVE_REQUESTED_MODEL',
+    'OPENAI_BASE_URL',
+    'OPENAI_API_KEY',
+    'OPENAI_MODEL',
+    'OPENAI_COMPAT_MODEL',
+  ] as const
+  const previous = new Map(names.map(name => [name, process.env[name]]))
+  try {
+    process.env.FORCE_OPENAI_COMPAT = '1'
+    process.env.FORCE_OPENAI_COMPAT_PRESERVE_REQUESTED_MODEL = '1'
+    process.env.OPENAI_BASE_URL = 'https://example.invalid/v1'
+    process.env.OPENAI_API_KEY = 'test-key'
+    process.env.OPENAI_MODEL = 'unrelated-default'
+    process.env.OPENAI_COMPAT_MODEL = 'another-unrelated-default'
+
+    const provider = pickWireProvider({ model: 'glm-5-2' })
+    const request = await provider!.buildRequest({
+      model: 'glm-5-2',
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+
+    expect(JSON.parse(request.body).model).toBe('glm-5-2')
+  } finally {
+    for (const name of names) {
+      const value = previous.get(name)
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+  }
 })
 
 test('openai-compat translates tool results with images to markdown', async () => {

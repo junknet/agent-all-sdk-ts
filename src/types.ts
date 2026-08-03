@@ -2,9 +2,16 @@ import type { AnthropicEventEmitter } from './emitter.js'
 
 export type WireProviderName = 'antigravity' | 'openai-compat' | 'codex' | 'anthropic-passthrough'
 
+export type ClientProtocol =
+  | 'anthropic_messages'
+  | 'openai_chat_completions'
+  | 'openai_responses'
+
 export interface ModelInfo {
   id: string
   name: string
+  /** Optional upstream admission contract, when the provider catalog supplies it. */
+  clientProtocol?: ClientProtocol
   supportsImages?: boolean
   supportsTools?: boolean
   supportsThinking?: boolean
