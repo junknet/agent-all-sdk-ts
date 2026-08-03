@@ -2,6 +2,7 @@ import type { IngressAdapter, AnthropicMessagesRequest } from './types.js'
 import { iterSSE, tryParseJSON } from './sse.js'
 import { decodeResponsesToAnthropic, encodeAnthropicToResponsesSSE } from './responses_api.js'
 import { parseAnthropicThinking, parseReasoningEffort } from './thinking.js'
+import { parseAnthropicSpeed, parseServiceTier } from './service_tier.js'
 import { normalizeToolTurns, resolveDefaultMaxTokens } from './anthropic_constraints.js'
 import { createUsageCollector, toOpenAIChatUsage } from './usage.js'
 
@@ -74,11 +75,13 @@ export class MessagesIngressAdapter implements IngressAdapter {
     const clientReasoning = parseAnthropicThinking(rawBody.thinking) ?? parseReasoningEffort(explicitEffort)
     rawBody.reasoning =
       clientReasoning ?? parseReasoningEffort(process.env.AGENT_GATEWAY_DEFAULT_EFFORT, 'gateway-default')
-    // 这三个键是 OpenAI 的档位表达，Anthropic 的 /v1/messages 不认，而本 adapter 是
+    const serviceTier = parseAnthropicSpeed(rawBody.speed) ?? parseServiceTier(rawBody.service_tier)
+    if (serviceTier) rawBody.serviceTier = serviceTier
+    // 这些键是网关消费的跨协议表达，Anthropic 的 /v1/messages 不认，而本 adapter 是
     // 近乎透传的 —— 读完不删就会原样带到上游，400 "reasoning_effort: Extra inputs are
     // not permitted"(实测 2026-08-03，claude-fable-5)。等于网关一边宣称支持这个入参，
     // 一边保证用了它就挂。消费掉就必须删掉。
-    for (const key of ['openai_reasoning_effort', 'reasoning_effort', 'thinking']) {
+    for (const key of ['openai_reasoning_effort', 'reasoning_effort', 'thinking', 'service_tier', 'speed']) {
       if (key in rawBody) delete rawBody[key]
     }
     return rawBody as AnthropicMessagesRequest
@@ -164,6 +167,8 @@ export class ChatIngressAdapter implements IngressAdapter {
     const reasoning = parseReasoningEffort(explicitEffort) ??
       parseReasoningEffort(process.env.AGENT_GATEWAY_DEFAULT_EFFORT, 'gateway-default')
     if (reasoning) req.reasoning = reasoning
+    const serviceTier = parseServiceTier(rawBody.service_tier)
+    if (serviceTier) req.serviceTier = serviceTier
     if (typeof rawBody.temperature === 'number') req.temperature = rawBody.temperature
     if (typeof rawBody.top_p === 'number') req.top_p = rawBody.top_p
 

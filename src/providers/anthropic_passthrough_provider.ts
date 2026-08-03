@@ -10,6 +10,7 @@ import type {
   QuotaInfo,
 } from '../types.js'
 import { parseAnthropicThinking, toAnthropicThinking } from '../thinking.js'
+import { parseAnthropicSpeed, parseServiceTier, toAnthropicSpeed } from '../service_tier.js'
 import type { AnthropicEventEmitter } from '../emitter.js'
 import type { TokenSource } from '../auth.js'
 import { reconcileThinkingSampling } from '../anthropic_constraints.js'
@@ -136,14 +137,25 @@ export function createAnthropicPassthroughProvider(
     name: 'anthropic-passthrough',
 
     async buildRequest(req: AnthropicMessagesRequest): Promise<WirePreparedRequest> {
-      const { reasoning, thinking: legacyThinking, ...requestWithoutReasoning } = req
+      const {
+        reasoning,
+        serviceTier: canonicalServiceTier,
+        thinking: legacyThinking,
+        service_tier: legacyServiceTier,
+        speed: legacySpeed,
+        ...requestWithoutGatewayFields
+      } = req
       // Direct provider callers may still hand us an Anthropic wire object. The
       // ingress path always supplies `reasoning`; this fallback keeps the public
       // provider factory backwards compatible without leaking the legacy field.
       const thinking = toAnthropicThinking(reasoning ?? parseAnthropicThinking(legacyThinking))
+      const serviceTier =
+        canonicalServiceTier ?? parseAnthropicSpeed(legacySpeed) ?? parseServiceTier(legacyServiceTier)
+      const speed = toAnthropicSpeed(serviceTier)
       const wireRequest: AnthropicMessagesRequest = {
-        ...requestWithoutReasoning,
+        ...requestWithoutGatewayFields,
         ...(thinking ? { thinking } : {}),
+        ...(speed ? { speed } : {}),
       }
       // Thinking 与采样参数的冲突多半是网关自己注入的，在发出去之前收掉。
       reconcileThinkingSampling(wireRequest)

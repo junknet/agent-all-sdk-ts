@@ -79,6 +79,7 @@ export function createOpenaiCompatProvider(opts: OpenaiCompatOpts): WireProvider
       if (req.max_tokens) body.max_tokens = req.max_tokens
       const effort = toCodexEffort(req.reasoning)
       if (effort) body.reasoning_effort = effort
+      if (req.serviceTier?.tier === 'priority') body.service_tier = 'priority'
 
       // o1 / o3 / o4 reasoning models don't accept temperature values other than 1.0, so omit
       if (!/^o[1-9]/.test(targetModel)) {

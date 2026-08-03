@@ -29,6 +29,7 @@ import type {
 import { iterSSE, formatSSE, tryParseJSON } from './sse.js'
 import { devlog } from './devlog.js'
 import { parseReasoningEffort } from './thinking.js'
+import { parseServiceTier } from './service_tier.js'
 import { normalizeToolTurns, resolveDefaultMaxTokens } from './anthropic_constraints.js'
 import { createUsageCollector, toResponsesUsage } from './usage.js'
 
@@ -275,6 +276,8 @@ export function decodeResponsesToAnthropic(req: any): {
   const reasoning = parseReasoningEffort(req.reasoning) ??
     parseReasoningEffort(process.env.AGENT_GATEWAY_DEFAULT_EFFORT, 'gateway-default')
   if (reasoning) out.reasoning = reasoning
+  const serviceTier = parseServiceTier(req.service_tier)
+  if (serviceTier) out.serviceTier = serviceTier
   const tc = toolChoice(req.tool_choice)
   if (tc) out.tool_choice = tc
   return { request: out, namespaceTools, droppedNamespaces }

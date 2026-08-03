@@ -31,11 +31,21 @@ export type ReasoningIntent =
       readonly effort: ThinkingEffort
       readonly source: 'client' | 'gateway-default'
     }
+
   | {
       readonly mode: 'budget'
       readonly budgetTokens: number
       readonly source: 'client' | 'gateway-default'
     }
+
+/**
+ * Provider-neutral request scheduling intent.  This is deliberately separate
+ * from `reasoning`: "fast" changes admission priority, not model deliberation.
+ */
+export interface ServiceTierIntent {
+  readonly tier: 'priority'
+  readonly source: 'client'
+}
 
 export interface QuotaInfo {
   tier?: string
@@ -85,6 +95,8 @@ export interface AnthropicMessagesRequest {
   stream?: boolean
   /** Canonical, provider-neutral reasoning intent used after ingress decoding. */
   reasoning?: ReasoningIntent
+  /** Canonical, provider-neutral scheduling intent used after ingress decoding. */
+  serviceTier?: ServiceTierIntent
   /** Anthropic wire input only; ingress normalizes it into `reasoning`. */
   thinking?: { type: 'enabled' | 'disabled'; budget_tokens?: number }
   metadata?: Record<string, unknown>

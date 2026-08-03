@@ -103,6 +103,7 @@ export function createCodexProvider(opts: CodexOpts): WireProvider {
       // 客户端传的上限对 codex 出口无效——由上游自行截断。
       const effort = toCodexEffort(req.reasoning)
       if (effort) body.reasoning = { effort }
+      if (req.serviceTier?.tier === 'priority') body.service_tier = 'priority'
 
       return {
         url: CODEX_ENDPOINT,
