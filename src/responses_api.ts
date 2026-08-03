@@ -28,6 +28,9 @@ import type {
 } from './types.js'
 import { iterSSE, formatSSE, tryParseJSON } from './sse.js'
 import { devlog } from './devlog.js'
+import { parseReasoningEffort } from './thinking.js'
+import { normalizeToolTurns, resolveDefaultMaxTokens } from './anthropic_constraints.js'
+import { createUsageCollector, toResponsesUsage } from './usage.js'
 
 // ── id generation ────────────────────────────────────────────────────
 let idCounter = 0
@@ -37,22 +40,6 @@ function genId(prefix: string): string {
 }
 
 // ── reasoning effort → Anthropic thinking budget ─────────────────────
-// codex always sends reasoning.effort; map it to a thinking budget so the Gemini
-// backend (antigravity) turns on thoughts. effort=none disables thinking entirely.
-function effortToThinking(
-  reasoning: { effort?: string } | undefined,
-): AnthropicMessagesRequest['thinking'] {
-  const effort = reasoning?.effort
-  if (!effort || effort === 'none') return undefined
-  const budget =
-    effort === 'minimal' || effort === 'low'
-      ? 1024
-      : effort === 'medium'
-        ? 4096
-        : 10000 // high / xhigh
-  return { type: 'enabled', budget_tokens: budget }
-}
-
 // ── data: URL → Anthropic base64 image source ────────────────────────
 function dataUrlToImageBlock(imageUrl: string): AnthropicContentBlock | null {
   const m = /^data:([^;]+);base64,(.*)$/s.exec(imageUrl)
@@ -263,6 +250,11 @@ export function decodeResponsesToAnthropic(req: any): {
     }
   }
   flush()
+  // 按 role 分组只保证了"连续同角色合并"，保证不了工具回合的不变量：codex 在自动压缩
+  // 之后会重放出 function_call 被砍、function_call_output 还在的历史(孤儿 tool_result，
+  // 上游 400 "unexpected `tool_use_id` found in `tool_result` blocks")，反过来也会留下
+  // 没有结果的 function_call。与另外两个入口共用同一套归一。
+  normalizeToolTurns(messages)
 
   const out: AnthropicMessagesRequest = {
     model: req.model,
@@ -272,11 +264,17 @@ export function decodeResponsesToAnthropic(req: any): {
   if (systemTexts.length > 0) out.system = systemTexts.join('\n\n')
   const tools = decodeTools(req.tools, namespaceTools, droppedNamespaces)
   if (tools) out.tools = tools
-  if (req.max_output_tokens) out.max_tokens = req.max_output_tokens
+  // codex CLI 根本不发 max_output_tokens(实测抓包 PROTOCOL_REFERENCE §11 的顶层字段
+  // 里就没有这个键)，而 Anthropic Messages 的 max_tokens 是必填 —— 于是
+  // codex --wire_api=responses 打任何 claude 模型，每一发都 400
+  // "max_tokens: Field required"，整条 codex→claude 路由是全废的(实测 2026-08-03，
+  // 用 §11 记录的真实请求体打 :8086 复现)。这里与 /v1/chat/completions 入口共用兜底值。
+  out.max_tokens = req.max_output_tokens || resolveDefaultMaxTokens()
   if (typeof req.temperature === 'number') out.temperature = req.temperature
   if (typeof req.top_p === 'number') out.top_p = req.top_p
-  const thinking = effortToThinking(req.reasoning)
-  if (thinking) out.thinking = thinking
+  const reasoning = parseReasoningEffort(req.reasoning) ??
+    parseReasoningEffort(process.env.AGENT_GATEWAY_DEFAULT_EFFORT, 'gateway-default')
+  if (reasoning) out.reasoning = reasoning
   const tc = toolChoice(req.tool_choice)
   if (tc) out.tool_choice = tc
   return { request: out, namespaceTools, droppedNamespaces }
@@ -337,8 +335,10 @@ export function encodeAnthropicToResponsesSSE(
   const items = new Map<number, OutItem>()
   const finalItems: Array<Record<string, unknown>> = []
   let outputCounter = 0
-  let usageIn = 0
-  let usageOut = 0
+  // Responses 的 usage 形状与 Chat 不同(input_tokens/output_tokens)，换算走 usage.ts；
+  // 缓存命中同样要算进 input_tokens —— codex 的缓存命中率极高(实测一轮 18661 里 17792
+  // 是缓存)，漏掉的话 codex 侧看到的上下文占用只有真实值的零头。
+  const usage = createUsageCollector()
   let stopReason = 'end_turn'
 
   return new ReadableStream<Uint8Array>({
@@ -354,11 +354,7 @@ export function encodeAnthropicToResponsesSSE(
         status,
         model,
         output: finalItems,
-        usage: {
-          input_tokens: usageIn,
-          output_tokens: usageOut,
-          total_tokens: usageIn + usageOut,
-        },
+        usage: toResponsesUsage(usage.snapshot()),
       })
 
       send('response.created', { type: 'response.created', response: responseEnvelope('in_progress') })
@@ -368,13 +364,13 @@ export function encodeAnthropicToResponsesSSE(
         for await (const ev of iterSSE(anthropicResponse)) {
           const data = tryParseJSON<any>(ev.data)
           if (!data) continue
+          // usage 字段名只认 usage.pickAnthropicUsage 那一处，message_start 与
+          // message_delta 两处都由它统一识别。
+          usage.observe(data)
 
           switch (data.type) {
-            case 'message_start': {
-              const u = data.message?.usage
-              if (typeof u?.input_tokens === 'number') usageIn = u.input_tokens
+            case 'message_start':
               break
-            }
             case 'content_block_start': {
               const idx: number = data.index
               const cb = data.content_block ?? {}
@@ -543,9 +539,6 @@ export function encodeAnthropicToResponsesSSE(
               const sr = data.delta?.stop_reason
               if (sr === 'tool_use') stopReason = 'tool_use'
               else if (sr) stopReason = sr
-              const u = data.usage
-              if (typeof u?.output_tokens === 'number') usageOut = u.output_tokens
-              if (typeof u?.input_tokens === 'number') usageIn = u.input_tokens
               break
             }
             case 'error': {

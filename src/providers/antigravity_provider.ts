@@ -14,8 +14,10 @@ import type {
   ModelInfo,
   QuotaInfo,
 } from '../types.js'
+import { toGeminiBudget } from '../thinking.js'
 import type { AnthropicEventEmitter } from '../emitter.js'
 import { iterSSE, tryParseJSON } from '../sse.js'
+import { splitCachedFromTotalInput } from '../usage.js'
 
 function getSessionId(): string {
   return Date.now().toString()
@@ -211,6 +213,7 @@ export function resolveAntigravityModel(input: string | undefined): string {
 export interface AntigravityModelMeta {
   enum: string
   budget: number
+  maxOutputTokens: number
 }
 
 // 上游 fetchAvailableModels 报的 maxOutputTokens：gemini 全系 65536、CloudCode 侧
@@ -226,13 +229,13 @@ const ANTIGRAVITY_MIN_VISIBLE = 4096
 // 要重核: 打 :fetchAvailableModels，读每个 model 的 `model`(enum) 与 `thinkingBudget`。
 export const ANTIGRAVITY_MODEL_META: Readonly<Record<string, AntigravityModelMeta>> = Object.freeze({
   // Gemini 3.6 Flash：当前最新档，ctx 1,048,576 / maxOut 65,536
-  'gemini-3.6-flash-high': { enum: 'MODEL_PLACEHOLDER_M71', budget: 10000 },
-  'gemini-3.6-flash-medium': { enum: 'MODEL_PLACEHOLDER_M72', budget: 4000 },
-  'gemini-3.6-flash-low': { enum: 'MODEL_PLACEHOLDER_M73', budget: 1000 },
+  'gemini-3.6-flash-high': { enum: 'MODEL_PLACEHOLDER_M71', budget: 10000, maxOutputTokens: 65536 },
+  'gemini-3.6-flash-medium': { enum: 'MODEL_PLACEHOLDER_M72', budget: 4000, maxOutputTokens: 65536 },
+  'gemini-3.6-flash-low': { enum: 'MODEL_PLACEHOLDER_M73', budget: 1000, maxOutputTokens: 65536 },
   // tiered = 动态思考预算(budget -1)，由上游自行分配
-  'gemini-3.6-flash-tiered': { enum: 'MODEL_PLACEHOLDER_M196', budget: -1 },
+  'gemini-3.6-flash-tiered': { enum: 'MODEL_PLACEHOLDER_M196', budget: -1, maxOutputTokens: 65536 },
   // Pro 档位，供 codex-g-max 等使用
-  'gemini-pro-agent': { enum: 'MODEL_PLACEHOLDER_M16', budget: 10001 },
+  'gemini-pro-agent': { enum: 'MODEL_PLACEHOLDER_M16', budget: 10001, maxOutputTokens: 65535 },
 })
 
 // Models with NO reasoning capability (PROTOCOL_REFERENCE §3.1, think=✗). Sending a
@@ -288,7 +291,7 @@ export function createAntigravityProvider(opts: AntigravityOpts): WireProvider {
       const gearBudget = meta && meta.budget > 0 ? meta.budget : 0
       const floor = gearBudget > 0 ? gearBudget + ANTIGRAVITY_MIN_VISIBLE : 0
       genCfg.maxOutputTokens = Math.min(
-        ANTIGRAVITY_MAX_OUTPUT,
+        meta?.maxOutputTokens ?? ANTIGRAVITY_MAX_OUTPUT,
         Math.max(req.max_tokens ?? ANTIGRAVITY_MAX_OUTPUT, floor),
       )
       if (typeof req.temperature === 'number') genCfg.temperature = req.temperature
@@ -303,10 +306,10 @@ export function createAntigravityProvider(opts: AntigravityOpts): WireProvider {
       //     means dynamic/adaptive → send includeThoughts but OMIT thinkingBudget (server
       //     self-paces). This is what gemini-3-flash does.
       //   - other thinking-capable models: honor the client's budget if provided.
-      const thinkingEnabled = req.thinking?.type === 'enabled'
-      if (!ANTIGRAVITY_NO_THINKING.has(targetModel) && (meta || thinkingEnabled)) {
+      const requestedBudget = toGeminiBudget(req.reasoning)
+      if (!ANTIGRAVITY_NO_THINKING.has(targetModel) && (meta || (req.reasoning && req.reasoning.mode !== 'disabled'))) {
         const thinkCfg: Record<string, unknown> = { includeThoughts: true }
-        const budget = meta ? meta.budget : (thinkingEnabled ? req.thinking?.budget_tokens ?? 0 : 0)
+        const budget = meta ? meta.budget : requestedBudget ?? 0
         if (budget > 0) thinkCfg.thinkingBudget = budget // budget<=0 (incl. -1 dynamic) → omit
         genCfg.thinkingConfig = thinkCfg
       }
@@ -379,9 +382,19 @@ export function createAntigravityProvider(opts: AntigravityOpts): WireProvider {
 
         const usage = chunk.response?.usageMetadata
         if (usage) {
+          // Gemini 的 promptTokenCount **含** cachedContentTokenCount。cloudcode 私有面
+          // 不暴露 cachedContent(PROTOCOL_REFERENCE §7: agy 不支持 prompt caching)，
+          // 所以这个字段实测一直缺席；仍然按标准 Gemini 口径拆一下，将来上游开了缓存
+          // 也不会把 prompt_tokens 算成双份。thoughtsTokenCount 已计在
+          // candidatesTokenCount 里，不另加。
+          const split = splitCachedFromTotalInput(
+            usage.promptTokenCount,
+            usage.cachedContentTokenCount,
+          )
           emitter.setUsage({
-            input: usage.promptTokenCount,
+            input: split.input,
             output: usage.candidatesTokenCount,
+            cacheRead: split.cacheRead,
           })
         }
 

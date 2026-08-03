@@ -56,13 +56,46 @@ src/
 - **Gemini thoughtSignature 缓存**（`antigravity_provider.ts`）：Gemini 多轮推理依赖每个 functionCall 的
   `thoughtSignature`，但它无法穿过 codex/openai 往返。网关按 `call_id` 服务端缓存真签名、replay 时贴回，
   替掉 `skip_thought_signature_validator` 占位——否则跨轮推理链断裂会导致重复规划 / MALFORMED / 400。
-- **百炼 (Bailian/DashScope) 出口**：模型 id 精确匹配 `deepseek-v4-flash*` 才路由到
-  `https://dashscope.aliyuncs.com/compatible-mode/v1`（`DASHSCOPE_API_KEY` / `DASHSCOPE_BASE_URL` /
-  `DASHSCOPE_MODEL` 可覆盖），且检查位置在所有凭据型分支（Claude/Codex）**之前**——避免被本地凭据
-  "顺手"接管，也避免其他模型误落进这条出口（按用户要求，仅此一个模型，不允许其他模型污染这条路由）。
-  该模型的 wire schema 接受 `image_url` 但模型本身**无视觉能力**（实测：200 返回但模型答"看不到图片"），
-  故 provider 以 `supportsImages:false` 构造，图片块在 `openai_compat_provider.ts` 侧统一降级为文字占位
-  `[image omitted: this model does not support image input]`，不再把大段 base64 塞进纯文本模型的上下文。
+- **DeepSeek 双平台出口（model 前缀区分）**：不带前缀的 `deepseek-v4-flash` / `deepseek-v4-pro`
+  默认走官方 Anthropic 兼容 API `https://api.deepseek.com/anthropic`；显式
+  `official/deepseek-v4-flash`、`official/deepseek-v4-pro` 也走官方。官方 API 的实际
+  model id 是小写 `deepseek-v4-flash` / `deepseek-v4-pro`，文档里的
+  `DeepSeek-V4-Flash-0731` 是模型版本标签，不是可传给官方 API 的 id。
+- **百炼前缀**：`bailian/deepseek-v4-flash-0731` 走
+  `https://dashscope.aliyuncs.com/compatible-mode/v1`，使用 `DASHSCOPE_API_KEY`、
+  `DASHSCOPE_BASE_URL`、`DASHSCOPE_MODEL`（可选）配置。百炼出口只接受明确的
+  `bailian/` 前缀，不会把其他模型目录污染到本路由。
+- 官方配置：`DEEPSEEK_API_KEY`，可用 `DEEPSEEK_ANTHROPIC_BASE_URL` 覆盖 Anthropic
+  兼容入口。官方透传原生 Anthropic 请求，不经过 OpenAI schema 转换。
+- 两个平台都关闭了本路由的「思考升档」改写，避免 DeepSeek 请求被误改成 Gemini。
+
+## 模型发现（`GET /v1/models`）
+
+网关只发布「已通过公开目录策略且当前凭据可用」的模型，不把上游旧版、内部或无凭据
+模型当作 fallback 广告。响应兼容 OpenAI list 形状，每项额外包含 OMP proxy discovery
+需要的 `supported_endpoint_types` / `context_length`，以及网关自有的能力元数据：
+
+- `capabilities.inputModalities`：文本 / 图片；
+- `capabilities.tools`：工具定义、调用与结果回放；
+- `capabilities.thinking`、`thinkingEfforts`、`canDisableThinking`：推理能力、档位与开关；
+- `max_output_tokens` 与 `context_length`：输出和上下文上限；
+- `capabilities.protocols`：网关的 Messages / Chat / Responses 三种入口。
+
+OMP 17.2.3 可用下列 provider 配置自动发现，无需手写 `models:` 清单：
+
+```yaml
+providers:
+  local-gw:
+    baseUrl: http://127.0.0.1:8085/v1
+    api: anthropic-messages
+    auth: none
+    disableStrictTools: true
+    discovery: { type: proxy }
+```
+
+stock OMP 只直接读取发现响应中的 `id/name/supported_endpoint_types/context_length`；图片、
+工具、推理档位和输出上限需在 OMP `modelOverrides` 中修正，直到 OMP 扩展 proxy 能力协商。
+网关新增/删除模型后执行 `omp models refresh`。
 
 ## 运行 / 验收
 
@@ -74,7 +107,8 @@ bun run src/server.ts          # 默认 :8085（AGENT_GATEWAY_PORT 可改）
 bun test                       # wire 契约 + 升档状态机 + 签名 lockstep + E2E（有凭据才跑对应后端）
 ```
 
-后端按「请求 model id + 本地凭据 + `CLAUDE_CODE_USE_*` 开关」自动选择；凭据来源见 `auth.ts`
-（`~/.claude/.credentials.json` / `~/.codex/auth.json` / `~/.gemini/oauth_creds.json` / 各 `*_API_KEY`）。
+后端按「请求 model id + 本地凭据 + `CLAUDE_CODE_USE_*` 开关」自动选择；DeepSeek 的平台
+由 model 前缀决定。凭据来源见 `auth.ts`（`~/.claude/.credentials.json` /
+`~/.codex/auth.json` / `~/.gemini/oauth_creds.json` / 各 `*_API_KEY`）。
 
 协议逐项 ground truth 见 [`PROTOCOL_REFERENCE.md`](./PROTOCOL_REFERENCE.md)。

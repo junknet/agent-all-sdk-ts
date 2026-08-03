@@ -5,11 +5,7 @@
 import { pickWireProvider, createWireAdapter, resolveModel, latestUserInput } from './index.js'
 import { pickIngressAdapter } from './ingress.js'
 import { decodeResponsesToAnthropic, encodeAnthropicToResponsesSSE } from './responses_api.js'
-import { createAntigravityProvider, ANTIGRAVITY_DEFAULT_MODEL } from './providers/antigravity_provider.js'
-import { createCodexProvider } from './providers/codex_provider.js'
-import { createAnthropicPassthroughProvider } from './providers/anthropic_passthrough_provider.js'
-import { createOpenaiCompatProvider } from './providers/openai_compat_provider.js'
-import { detectLocalCredits } from './auth.js'
+import { createModelsListResponse, listAvailableModels } from './model_catalog.js'
 import { slimAnthropicRequest } from './slim.js'
 import { devlog, newTrace, setTraceMeta } from './devlog.js'
 
@@ -47,75 +43,6 @@ function identifyClient(
 
 const PORT = Number(process.env.AGENT_GATEWAY_PORT ?? 8085)
 
-// ── Model listing ──────────────────────────────────────────────────
-// Fallback only — used if every provider's live catalog fetch fails.
-const FALLBACK_MODELS = [
-  { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash' },
-  { id: 'gemini-3.6-flash-high', name: 'Gemini 3.6 Flash High' },
-  { id: 'gemini-3.6-flash-medium', name: 'Gemini 3.6 Flash Medium' },
-  { id: 'gemini-3.6-flash-low', name: 'Gemini 3.6 Flash Low' },
-  { id: 'claude-opus-5', name: 'Claude Opus 5' },
-  { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' },
-  { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash (DashScope)' },
-]
-
-// listAllModels aggregates each backend's authoritative catalog (gemini via
-// fetchAvailableModels, codex via /models). Per-provider failures are isolated so one
-// dead credential never blanks the whole list.
-async function listAllModels(): Promise<Array<{ id: string; name: string }>> {
-  const out: Array<{ id: string; name: string }> = []
-  try {
-    const ag = createAntigravityProvider({ model: ANTIGRAVITY_DEFAULT_MODEL })
-    await ag.prepare?.()
-    if (ag.listModels) out.push(...(await ag.listModels()))
-  } catch (e: any) {
-    console.error('listModels antigravity failed:', e?.message ?? e)
-  }
-  const credits = detectLocalCredits()
-  try {
-    const codexCredit = credits.find(c => c.provider === 'codex')
-    if (codexCredit?.type === 'oauth' && codexCredit.source) {
-      const cx = createCodexProvider({ source: codexCredit.source })
-      await cx.prepare?.()
-      if (cx.listModels) out.push(...(await cx.listModels()))
-    }
-  } catch (e: any) {
-    console.error('listModels codex failed:', e?.message ?? e)
-  }
-  try {
-    const claudeCredit = credits.find(c => c.provider === 'claude')
-    if (claudeCredit) {
-      const cl = createAnthropicPassthroughProvider({
-        baseURL: process.env.ANTHROPIC_BASE_URL ?? 'https://api.anthropic.com',
-        apiKey: claudeCredit.type === 'api_key' ? (claudeCredit.value ?? '') : '',
-        model: 'claude-opus-5',
-        ...(claudeCredit.type === 'oauth' && claudeCredit.source
-          ? { source: claudeCredit.source }
-          : {}),
-      })
-      await cl.prepare?.()
-      if (cl.listModels) out.push(...(await cl.listModels()))
-    }
-  } catch (e: any) {
-    console.error('listModels claude failed:', e?.message ?? e)
-  }
-  // DashScope (百炼) — deepseek-v4-flash
-  if (process.env.DASHSCOPE_API_KEY) {
-    try {
-      const ds = createOpenaiCompatProvider({
-        baseURL: process.env.DASHSCOPE_BASE_URL ?? 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-        apiKey: process.env.DASHSCOPE_API_KEY,
-        model: 'deepseek-v4-flash',
-      })
-      await ds.prepare?.()
-      if (ds.listModels) out.push(...(await ds.listModels()))
-    } catch (e: any) {
-      console.error('listModels dashscope failed:', e?.message ?? e)
-    }
-  }
-  return out.length > 0 ? out : FALLBACK_MODELS
-}
-
 // ── HTTP Gateway Server ─────────────────────────────────────────────
 console.log(`Starting TS Gateway Server on port ${PORT}...`)
 
@@ -146,10 +73,10 @@ Bun.serve({
 
     console.log(`HIT: ${req.method} ${url.pathname}`)
 
-    // 1. Models endpoint — live aggregated catalog across backends
+    // 1. Models endpoint — curated public catalog filtered by available credentials
     if (url.pathname === '/v1/models' && req.method === 'GET') {
-      const models = await listAllModels()
-      return new Response(JSON.stringify({ data: models }), {
+      const models = await listAvailableModels()
+      return new Response(JSON.stringify(createModelsListResponse(models)), {
         headers: { 'Content-Type': 'application/json' },
       })
     }

@@ -114,10 +114,19 @@ export function devlog(trace: string, phase: string, data: Record<string, unknow
   try {
     let line = JSON.stringify(record)
     if (line.length > MAX_RECORD_BYTES) {
+      // 曾经直接对已 stringify 的文本裸切片再拼一个收尾大括号——切点如果落在转义序列
+      // 中间(比如 \" 或 \\n 断开)，就会产出非法 JSON，下游 jq/python 全解析失败，
+      // 诊断时反而两眼一抹黑(实测 2026-08-02)。这里把截断后的半截原文当作**普通字符
+      // 串**重新 JSON.stringify，不管切在哪个字节，外层永远是合法 JSON。
       const dropped = line.length - MAX_RECORD_BYTES
-      line =
-        line.slice(0, MAX_RECORD_BYTES) +
-        `…"__truncated_bytes":${dropped}}`
+      line = JSON.stringify({
+        ts: record.ts,
+        trace,
+        ...meta,
+        phase,
+        __truncated_bytes: dropped,
+        __head: line.slice(0, MAX_RECORD_BYTES),
+      })
     }
     appendFileSync(logFilePath(), line + '\n')
   } catch {}

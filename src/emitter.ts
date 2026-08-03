@@ -3,6 +3,7 @@
  */
 
 import { formatSSE, tryParseJSON } from './sse.js'
+import { pickAnthropicUsage } from './usage.js'
 
 type BlockType = 'text' | 'thinking' | 'tool_use'
 
@@ -17,6 +18,10 @@ export class AnthropicEventEmitter {
   private model = ''
   private inputTokens = 0
   private outputTokens = 0
+  // 缓存命中/写入的 token。它们一样占上下文窗口，出口算 prompt_tokens 必须加回去，
+  // 所以要跟着 IR 一路带到出站流里(见 usage.ts 的口径说明)。
+  private cacheReadTokens = 0
+  private cacheCreationTokens = 0
   private currentBlockIndex = -1
   private currentBlockType: BlockType | null = null
   private currentToolCallId = ''
@@ -166,13 +171,43 @@ export class AnthropicEventEmitter {
     this.stopReason = r
   }
 
-  setUsage(opts: { input?: number; output?: number }): void {
+  setUsage(opts: {
+    input?: number
+    output?: number
+    cacheRead?: number
+    cacheCreation?: number
+  }): void {
     if (typeof opts.input === 'number') this.inputTokens = opts.input
     if (typeof opts.output === 'number') this.outputTokens = opts.output
+    if (typeof opts.cacheRead === 'number') this.cacheReadTokens = opts.cacheRead
+    if (typeof opts.cacheCreation === 'number') this.cacheCreationTokens = opts.cacheCreation
   }
 
-  getUsage(): { input: number; output: number } {
-    return { input: this.inputTokens, output: this.outputTokens }
+  getUsage(): {
+    input: number
+    output: number
+    cacheRead: number
+    cacheCreation: number
+  } {
+    return {
+      input: this.inputTokens,
+      output: this.outputTokens,
+      cacheRead: this.cacheReadTokens,
+      cacheCreation: this.cacheCreationTokens,
+    }
+  }
+
+  // 出站 Anthropic SSE 的 usage 载荷。缓存字段只在真有值时出现 —— 恒定写 0 会让下游
+  // 分不清「上游不支持缓存」和「这轮没命中」。
+  private usagePayload(): Record<string, number> {
+    return {
+      input_tokens: this.inputTokens,
+      output_tokens: this.outputTokens,
+      ...(this.cacheReadTokens > 0 ? { cache_read_input_tokens: this.cacheReadTokens } : {}),
+      ...(this.cacheCreationTokens > 0
+        ? { cache_creation_input_tokens: this.cacheCreationTokens }
+        : {}),
+    }
   }
 
   getToolUseCount(): number {
@@ -191,7 +226,7 @@ export class AnthropicEventEmitter {
       formatSSE('message_delta', {
         type: 'message_delta',
         delta: { stop_reason: this.stopReason, stop_sequence: null },
-        usage: { input_tokens: this.inputTokens, output_tokens: this.outputTokens },
+        usage: this.usagePayload(),
       }),
     )
     this.chunks.push(formatSSE('message_stop', { type: 'message_stop' }))
@@ -223,20 +258,23 @@ export class AnthropicEventEmitter {
         if (!line.startsWith('data:')) continue
         const payload = line.slice(5).trim()
         if (payload.length === 0 || payload === '[DONE]') continue
-        const obj = JSON.parse(payload) as {
-          type?: string
-          message?: { usage?: { input_tokens?: number; output_tokens?: number } }
-          usage?: { input_tokens?: number; output_tokens?: number }
-        }
-        const usage = obj.message?.usage ?? obj.usage
-        if (usage) {
-          if (typeof usage.input_tokens === 'number') {
-            this.setUsage({ input: usage.input_tokens })
-          }
-          if (typeof usage.output_tokens === 'number') {
-            this.setUsage({ output: usage.output_tokens })
-          }
-        }
+        const obj = JSON.parse(payload) as { type?: string }
+        // 字段名只认一处(usage.pickAnthropicUsage)，别在这里再抄一遍。
+        const picked = pickAnthropicUsage(obj)
+        this.setUsage({
+          input: picked.inputTokens,
+          output: picked.outputTokens,
+          cacheRead: picked.cacheReadTokens,
+          cacheCreation: picked.cacheCreationTokens,
+        })
+        // 转发过来的原始流里已经有 message_stop 了，就不能再补一份自己的收尾。
+        // 补了的话下游收到的是"一条 message 里两个 message_stop"，而且后补的那条
+        // message_delta 用的是本 emitter 的默认 stop_reason=end_turn，会把上游真实的
+        // stop_reason 覆盖掉 —— 实测 2026-08-02 的流量日志里，上游明明回
+        // stop_reason:"max_tokens"，网关补的尾巴又改回 end_turn；tool_use 同理。
+        // 经 /v1/chat/completions 出去时表现为两个 data:[DONE] 和一个多余的
+        // finish_reason:"stop"。只有裸转发(emitRawChunk)的 provider 会走到这里。
+        if (obj.type === 'message_stop') this.finished = true
       }
     } catch {}
   }

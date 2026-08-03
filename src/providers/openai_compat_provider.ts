@@ -12,8 +12,29 @@ import type {
   ModelInfo,
   QuotaInfo,
 } from '../types.js'
+import { toCodexEffort } from '../thinking.js'
 import type { AnthropicEventEmitter } from '../emitter.js'
 import { iterSSE, tryParseJSON } from '../sse.js'
+import { splitCachedFromTotalInput } from '../usage.js'
+
+// OpenAI 兼容后端的 prompt_tokens **含**缓存命中部分，缓存命中数各家字段名不同：
+// DeepSeek 叫 prompt_cache_hit_tokens(实测 api.deepseek.com)，OpenAI 官方与多数
+// 兼容实现叫 prompt_tokens_details.cached_tokens。IR 用 Anthropic 语义(input 不含缓存),
+// 所以要先拆出来；两个都没有就当作没有缓存信息，不硬造 0。
+function normalizeOpenAIUsage(usage: any): {
+  input?: number
+  output?: number
+  cacheRead?: number
+} {
+  const cached =
+    typeof usage?.prompt_cache_hit_tokens === 'number'
+      ? usage.prompt_cache_hit_tokens
+      : typeof usage?.prompt_tokens_details?.cached_tokens === 'number'
+        ? usage.prompt_tokens_details.cached_tokens
+        : undefined
+  const split = splitCachedFromTotalInput(usage?.prompt_tokens, cached)
+  return { input: split.input, output: usage?.completion_tokens, cacheRead: split.cacheRead }
+}
 
 export interface OpenaiCompatOpts {
   baseURL: string
@@ -29,13 +50,17 @@ export interface OpenaiCompatOpts {
    * embedding megabytes of base64 for a model that can't use it is pure
    * wasted context/tokens and a confusing dead end, so when false we degrade
    * every image block to a short text placeholder instead of image_url.
+   * When false (default), OPENAI_MODEL / OPENAI_COMPAT_MODEL may override opts.model.
+   * Set true for a routed model whose prefix is the source of truth.
    */
+  ignoreEnvironmentModel?: boolean
   supportsImages?: boolean
 }
 
 export function createOpenaiCompatProvider(opts: OpenaiCompatOpts): WireProvider {
-  const targetModel =
-    process.env.OPENAI_MODEL || process.env.OPENAI_COMPAT_MODEL || opts.model || 'gpt-4o'
+  const targetModel = opts.ignoreEnvironmentModel
+    ? opts.model || 'gpt-4o'
+    : process.env.OPENAI_MODEL || process.env.OPENAI_COMPAT_MODEL || opts.model || 'gpt-4o'
   const supportsImages = opts.supportsImages ?? true
 
   return {
@@ -52,6 +77,8 @@ export function createOpenaiCompatProvider(opts: OpenaiCompatOpts): WireProvider
       }
       if (req.tools && req.tools.length > 0) body.tools = translateTools(req.tools)
       if (req.max_tokens) body.max_tokens = req.max_tokens
+      const effort = toCodexEffort(req.reasoning)
+      if (effort) body.reasoning_effort = effort
 
       // o1 / o3 / o4 reasoning models don't accept temperature values other than 1.0, so omit
       if (!/^o[1-9]/.test(targetModel)) {
@@ -119,12 +146,7 @@ export function createOpenaiCompatProvider(opts: OpenaiCompatOpts): WireProvider
             if (hadTools) emitter.setStopReason('tool_use')
           }
         }
-        if (json.usage) {
-          emitter.setUsage({
-            input: json.usage.prompt_tokens,
-            output: json.usage.completion_tokens,
-          })
-        }
+        if (json.usage) emitter.setUsage(normalizeOpenAIUsage(json.usage))
         if (choice?.finish_reason === 'length') emitter.setStopReason('max_tokens')
         emitter.finish()
         return
@@ -153,10 +175,7 @@ export function createOpenaiCompatProvider(opts: OpenaiCompatOpts): WireProvider
         const delta = choice?.delta
 
         if (!delta && chunk.usage) {
-          emitter.setUsage({
-            input: chunk.usage.prompt_tokens,
-            output: chunk.usage.completion_tokens,
-          })
+          emitter.setUsage(normalizeOpenAIUsage(chunk.usage))
           continue
         }
         if (!delta) continue

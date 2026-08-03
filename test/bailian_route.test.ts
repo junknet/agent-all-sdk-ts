@@ -1,49 +1,68 @@
 import { test, expect } from 'bun:test'
-import { pickWireProvider } from '../src/index.js'
+import { pickWireProvider, resolveModel } from '../src/index.js'
 import { createOpenaiCompatProvider } from '../src/providers/openai_compat_provider.js'
 
-// ── Routing: deepseek-v4-flash must hit the Bailian/DashScope route, and ONLY that model ──
+// DeepSeek platform selection is explicit in the model id. Bare V4 ids default
+// to the official Anthropic-compatible endpoint; dated 0731 ids require Bailian.
 
-test('pickWireProvider routes deepseek-v4-flash to DashScope compatible-mode', () => {
-  const prevBase = process.env.DASHSCOPE_BASE_URL
-  const prevKey = process.env.DASHSCOPE_API_KEY
-  process.env.DASHSCOPE_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
-  process.env.DASHSCOPE_API_KEY = 'sk-test'
+test('bare deepseek-v4-flash routes to the official Anthropic endpoint', async () => {
+  const prevKey = process.env.DEEPSEEK_API_KEY
+  const prevBase = process.env.DEEPSEEK_ANTHROPIC_BASE_URL
+  process.env.DEEPSEEK_API_KEY = 'sk-official-test'
+  process.env.DEEPSEEK_ANTHROPIC_BASE_URL = 'https://api.deepseek.com/anthropic'
   try {
-    const provider = pickWireProvider({ model: 'deepseek-v4-flash-0731' })
-    expect(provider).not.toBeNull()
-    expect(provider!.name).toBe('openai-compat')
+    const provider = pickWireProvider({ model: 'deepseek-v4-flash' })
+    expect(provider?.name).toBe('anthropic-passthrough')
+    const request = await provider!.buildRequest({
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'hello' }],
+      stream: true,
+    })
+    expect(request.url).toBe('https://api.deepseek.com/anthropic/v1/messages')
+    expect(JSON.parse(request.body).model).toBe('deepseek-v4-flash')
   } finally {
-    if (prevBase === undefined) delete process.env.DASHSCOPE_BASE_URL
-    else process.env.DASHSCOPE_BASE_URL = prevBase
+    if (prevKey === undefined) delete process.env.DEEPSEEK_API_KEY
+    else process.env.DEEPSEEK_API_KEY = prevKey
+    if (prevBase === undefined) delete process.env.DEEPSEEK_ANTHROPIC_BASE_URL
+    else process.env.DEEPSEEK_ANTHROPIC_BASE_URL = prevBase
+  }
+})
+
+test('bailian prefix routes dated DeepSeek V4 Flash to DashScope', async () => {
+  const prevKey = process.env.DASHSCOPE_API_KEY
+  const prevBase = process.env.DASHSCOPE_BASE_URL
+  process.env.DASHSCOPE_API_KEY = 'sk-bailian-test'
+  process.env.DASHSCOPE_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+  try {
+    const provider = pickWireProvider({ model: 'bailian/deepseek-v4-flash-0731' })
+    expect(provider?.name).toBe('openai-compat')
+    const request = await provider!.buildRequest({
+      model: 'bailian/deepseek-v4-flash-0731',
+      messages: [{ role: 'user', content: 'hello' }],
+      stream: true,
+    })
+    expect(request.url).toBe(
+      'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
+    )
+    expect(JSON.parse(request.body).model).toBe('deepseek-v4-flash-0731')
+  } finally {
     if (prevKey === undefined) delete process.env.DASHSCOPE_API_KEY
     else process.env.DASHSCOPE_API_KEY = prevKey
-  }
-})
-
-test('pickWireProvider does NOT route unrelated models to Bailian (no contamination)', () => {
-  // A model that looks nothing like deepseek-v4-flash must never fall into the Bailian
-  // branch, regardless of DASHSCOPE_* env presence — this is the "别的模型不要进来污染" contract.
-  const prevBase = process.env.DASHSCOPE_BASE_URL
-  process.env.DASHSCOPE_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
-  try {
-    const provider = pickWireProvider({ model: 'deepseek-v3-chat' })
-    // deepseek-v3-chat doesn't match /^deepseek-v4-flash/ so it must not resolve via Bailian.
-    // With no other credentials/env configured in this test process it may resolve to null
-    // or to some other branch, but it must NOT be the openai-compat provider constructed
-    // with the DashScope base URL. We assert indirectly: build a probe request through
-    // pickWireProvider and confirm it never touches the dashscope URL path by re-deriving
-    // an independent provider for comparison of shape (name only, since URL is internal).
-    if (provider) {
-      // Only reachable branches without credentials are Bailian (model-gated) or
-      // OPENAI-compat-with-env (env-gated, not set here) — assert not silently absorbed.
-      expect(provider.name).not.toBe('antigravity')
-    }
-  } finally {
     if (prevBase === undefined) delete process.env.DASHSCOPE_BASE_URL
     else process.env.DASHSCOPE_BASE_URL = prevBase
   }
 })
+
+test('official route rejects the dated model id without a Bailian prefix', () => {
+  expect(() => pickWireProvider({ model: 'deepseek-v4-flash-0731' })).toThrow(
+    /bailian\/deepseek-v4-flash-0731/,
+  )
+})
+test('DeepSeek route is not changed by the thinking escalation', () => {
+  const resolved = resolveModel('deepseek-v4-flash', 'think hard')
+  expect(resolved).toEqual({ model: 'deepseek-v4-flash', escalated: false })
+})
+
 
 test('Bailian route sets supportsImages:false so images degrade to a text placeholder', async () => {
   // Exercises the same code path index.ts wires up for deepseek-v4-flash: openai-compat

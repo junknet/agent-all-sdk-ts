@@ -12,9 +12,11 @@ import type {
   ModelInfo,
   QuotaInfo,
 } from '../types.js'
+import { toCodexEffort } from '../thinking.js'
 import type { AnthropicEventEmitter } from '../emitter.js'
 import { iterSSE, tryParseJSON } from '../sse.js'
 import type { TokenSource } from '../auth.js'
+import { splitCachedFromTotalInput } from '../usage.js'
 
 // 实测: ChatGPT 账号(含 k12 plan)经 backend-api/codex/responses 只接受这几个通用 slug;
 // codex 专用 slug(*-codex / *-codex-max)仅对有 Codex 席位的 workspace 开放,k12 走这批会 400。
@@ -25,7 +27,6 @@ export const CODEX_MODELS = [
   { id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', description: 'Latest frontier agentic coding model' },
   { id: 'gpt-5.6-terra', label: 'GPT-5.6 Terra', description: 'Balanced agentic coding model for everyday work' },
   { id: 'gpt-5.6-luna', label: 'GPT-5.6 Luna', description: 'Fast and affordable agentic coding model' },
-  { id: 'gpt-5.5', label: 'GPT-5.5', description: 'Frontier model for complex coding and research' },
   { id: 'gpt-5.4', label: 'GPT-5.4', description: 'Strong model for everyday coding' },
   { id: 'gpt-5.4-mini', label: 'GPT-5.4 Mini', description: 'Small, fast, cost-efficient for simpler coding' },
   { id: 'gpt-5.3-codex-spark', label: 'GPT-5.3 Codex Spark', description: 'Ultra-fast coding model' },
@@ -100,11 +101,8 @@ export function createCodexProvider(opts: CodexOpts): WireProvider {
       // IR 的 max_tokens 在此丢弃: Codex Responses 端点现已拒收 max_output_tokens
       // (400 "Unsupported parameter: max_output_tokens")，且无等价替代参数。
       // 客户端传的上限对 codex 出口无效——由上游自行截断。
-      if (req.thinking?.type === 'enabled' && req.thinking.budget_tokens) {
-        const tokens = req.thinking.budget_tokens
-        const effort = tokens <= 1024 ? 'low' : tokens <= 4096 ? 'medium' : 'high'
-        body.reasoning = { effort }
-      }
+      const effort = toCodexEffort(req.reasoning)
+      if (effort) body.reasoning = { effort }
 
       return {
         url: CODEX_ENDPOINT,
@@ -307,9 +305,17 @@ export function createCodexProvider(opts: CodexOpts): WireProvider {
           case 'response.completed': {
             const usage = data.response?.usage
             if (usage) {
+              // Responses API 的 input_tokens **含** input_tokens_details.cached_tokens
+              // (实测 PROTOCOL_REFERENCE §11: input_tokens 18661 里 cached 17792)。
+              // IR 用 Anthropic 语义(input 不含缓存)，所以这里先拆出来，出口再加回去。
+              const split = splitCachedFromTotalInput(
+                usage.input_tokens,
+                usage.input_tokens_details?.cached_tokens,
+              )
               emitter.setUsage({
-                input: usage.input_tokens,
+                input: split.input,
                 output: usage.output_tokens,
+                cacheRead: split.cacheRead,
               })
             }
             break

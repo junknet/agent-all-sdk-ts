@@ -1,6 +1,9 @@
 import type { IngressAdapter, AnthropicMessagesRequest } from './types.js'
-import { iterSSE } from './sse.js'
+import { iterSSE, tryParseJSON } from './sse.js'
 import { decodeResponsesToAnthropic, encodeAnthropicToResponsesSSE } from './responses_api.js'
+import { parseAnthropicThinking, parseReasoningEffort } from './thinking.js'
+import { normalizeToolTurns, resolveDefaultMaxTokens } from './anthropic_constraints.js'
+import { createUsageCollector, toOpenAIChatUsage } from './usage.js'
 
 // OpenAI 的 tool_calls.function.arguments 是 JSON 字符串，Anthropic 的
 // tool_use.input 是对象。解析失败时兜成空对象，避免整轮请求因一个坏参数挂掉。
@@ -26,7 +29,11 @@ function convertChatContent(content: unknown): unknown {
     if (!part || typeof part !== 'object') continue
     const p = part as any
     if (p.type === 'text' && typeof p.text === 'string') {
-      out.push({ type: 'text', text: p.text })
+      // 空 text 块必须丢掉，不能原样转过去：上游 400 "messages: text content blocks
+      // must be non-empty"。OpenAI 客户端粘图时非常容易发出
+      // [{type:'text',text:''},{type:'image_url',…}] 这种"没配文字的图"形状，
+      // 实测经 /v1/chat/completions 打 claude-fable-5 必死。
+      if (p.text !== '') out.push({ type: 'text', text: p.text })
       continue
     }
     if (p.type === 'image_url') {
@@ -46,33 +53,34 @@ function convertChatContent(content: unknown): unknown {
   return out.length > 0 ? out : ''
 }
 
+// 工具回合的归一(每个 tool_use 恰好一个 tool_result、紧随其后、排在最前、孤儿丢弃)
+// 统一由 anthropic_constraints.normalizeToolTurns 负责，三个入口共用一套 —— 这类缺陷
+// 的历史教训就是"一个入口修一次"永远漏，见该文件顶部的实测约束表。
+
 // OpenAI 用 reasoning_effort 字符串档位，Anthropic 用 thinking.budget_tokens 数值。
 // 请求侧原先完全不接推理字段(只在响应侧回 reasoning_content)，于是任何经
 // /v1/chat/completions 的客户端都无法控制思考档位 —— 下游 harness 的"调推理等级"是死的。
-// 档位→预算的映射与 codex_provider 的反向映射保持一致(low≤1024 / medium≤4096 / high)。
-const EFFORT_BUDGET: Record<string, number> = {
-  none: 0,
-  minimal: 512,
-  low: 1024,
-  medium: 4096,
-  high: 10000,
-  xhigh: 20000,
-  max: 32000,
-}
-
-function effortToThinking(raw: unknown): { type: 'enabled'; budget_tokens: number } | undefined {
-  const key =
-    typeof raw === 'string' ? raw : typeof (raw as any)?.effort === 'string' ? (raw as any).effort : ''
-  const v = EFFORT_BUDGET[key.toLowerCase()]
-  if (v === undefined || v <= 0) return undefined
-  return { type: 'enabled', budget_tokens: v }
-}
-
+// 档位→预算由 thinking.ts 统一管理；显式 none/off 必须压过网关默认档位。
 // ── Messages Ingress Adapter (Anthropic /v1/messages) ────────────────
 export class MessagesIngressAdapter implements IngressAdapter {
   readonly protocol = 'messages'
 
   decodeRequest(rawBody: any): AnthropicMessagesRequest {
+    if (Array.isArray(rawBody?.messages)) {
+      normalizeToolTurns(rawBody.messages)
+    }
+    const explicitEffort =
+      rawBody.openai_reasoning_effort ?? rawBody.reasoning_effort ?? rawBody.reasoning
+    const clientReasoning = parseAnthropicThinking(rawBody.thinking) ?? parseReasoningEffort(explicitEffort)
+    rawBody.reasoning =
+      clientReasoning ?? parseReasoningEffort(process.env.AGENT_GATEWAY_DEFAULT_EFFORT, 'gateway-default')
+    // 这三个键是 OpenAI 的档位表达，Anthropic 的 /v1/messages 不认，而本 adapter 是
+    // 近乎透传的 —— 读完不删就会原样带到上游，400 "reasoning_effort: Extra inputs are
+    // not permitted"(实测 2026-08-03，claude-fable-5)。等于网关一边宣称支持这个入参，
+    // 一边保证用了它就挂。消费掉就必须删掉。
+    for (const key of ['openai_reasoning_effort', 'reasoning_effort', 'thinking']) {
+      if (key in rawBody) delete rawBody[key]
+    }
     return rawBody as AnthropicMessagesRequest
   }
 
@@ -135,6 +143,8 @@ export class ChatIngressAdapter implements IngressAdapter {
       }
     }
 
+    normalizeToolTurns(messages)
+
     const req: any = {
       model: rawBody.model,
       messages,
@@ -145,27 +155,32 @@ export class ChatIngressAdapter implements IngressAdapter {
     // max_tokens 在 OpenAI Chat 协议里可省略，在 Anthropic Messages 里是必填 ——
     // 省略时上游直接 400 "max_tokens: Field required"，整轮请求死(实测 jcode 的
     // openai-compatible provider 就不发这个字段)。这里给 IR 补一个默认上限；
-    // 客户端显式给了就用客户端的。可用 AGENT_GATEWAY_DEFAULT_MAX_TOKENS 调整。
-    const envDefault = Number(process.env.AGENT_GATEWAY_DEFAULT_MAX_TOKENS)
+    // 客户端显式给了就用客户端的。兜底值与 /v1/responses 入口共用。
     req.max_tokens =
-      rawBody.max_tokens ??
-      rawBody.max_completion_tokens ??
-      (Number.isFinite(envDefault) && envDefault > 0 ? envDefault : 65536)
+      rawBody.max_tokens ?? rawBody.max_completion_tokens ?? resolveDefaultMaxTokens()
     // reasoning_effort 是 OpenAI 的顶层字段；reasoning:{effort} 是 Responses 风格。
     // 客户端没给时用 AGENT_GATEWAY_DEFAULT_EFFORT(默认不开思考，保持原行为)。
-    const think =
-      effortToThinking(rawBody.reasoning_effort) ??
-      effortToThinking(rawBody.reasoning) ??
-      effortToThinking(process.env.AGENT_GATEWAY_DEFAULT_EFFORT)
-    if (think) req.thinking = think
+    const explicitEffort = rawBody.reasoning_effort ?? rawBody.reasoning
+    const reasoning = parseReasoningEffort(explicitEffort) ??
+      parseReasoningEffort(process.env.AGENT_GATEWAY_DEFAULT_EFFORT, 'gateway-default')
+    if (reasoning) req.reasoning = reasoning
     if (typeof rawBody.temperature === 'number') req.temperature = rawBody.temperature
     if (typeof rawBody.top_p === 'number') req.top_p = rawBody.top_p
 
     if (Array.isArray(rawBody.tools)) {
+      // OpenAI 的 function.parameters 对无参工具可以整个省略，Anthropic 的
+      // input_schema 是必填且必须是对象 —— 缺了上游 400
+      // "tools.0.custom.input_schema: Field required"，非对象则 400
+      // "input_schema: Input does not match the expected shape."(两条都实测过)。
+      // 补一个空对象 schema 即可，语义等价于"这个工具不收参数"。
+      // /v1/responses 入口早就这么兜底了，这里是把两个 OpenAI 入口拉齐。
       req.tools = rawBody.tools.map((t: any) => ({
         name: t.function?.name,
         description: t.function?.description,
-        input_schema: t.function?.parameters,
+        input_schema:
+          t.function?.parameters && typeof t.function.parameters === 'object'
+            ? t.function.parameters
+            : { type: 'object', properties: {} },
       }))
     }
 
@@ -185,10 +200,12 @@ export class ChatIngressAdapter implements IngressAdapter {
       let content = ''
       let reasoning = ''
       const toolCalls: any[] = []
+      const usage = createUsageCollector()
 
       for await (const ev of streamEvents) {
         try {
           const payload = JSON.parse(ev.data)
+          usage.observe(payload)
           if (payload.type === 'content_block_delta') {
             if (payload.delta?.type === 'text_delta') content += payload.delta.text
             if (payload.delta?.type === 'thinking_delta') reasoning += payload.delta.thinking
@@ -223,6 +240,9 @@ export class ChatIngressAdapter implements IngressAdapter {
           },
           finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
         }],
+        // 非流式的 usage 在 OpenAI 契约里是**无条件**回的(不受 stream_options 约束)。
+        // 缺了它下游 harness 算不出上下文占用，70% 压缩阈值就是死的。
+        usage: toOpenAIChatUsage(usage.snapshot()),
       }
 
       return new Response(JSON.stringify(responseBody), {
@@ -232,14 +252,34 @@ export class ChatIngressAdapter implements IngressAdapter {
 
     // Handle Stream Response: Transform Anthropic SSE stream to OpenAI SSE stream
     const encoder = new TextEncoder()
+    // OpenAI 契约: 流式的 usage 只在客户端显式 stream_options.include_usage=true 时回，
+    // 形式是 [DONE] 之前多发一个 choices:[] 且带 usage 的 chunk。无条件塞会让按契约
+    // 严格解析的客户端在 choices[0] 上炸掉，所以这里必须看客户端有没有声明。
+    const includeUsage = originalRequest?.stream_options?.include_usage === true
+    const usage = createUsageCollector()
     const transformStream = new ReadableStream<Uint8Array>({
       async start(controller) {
         try {
           for await (const event of iterSSE(upstreamResponse)) {
+            const payload = tryParseJSON<any>(event.data)
+            if (payload) usage.observe(payload)
             const openaiChunk = translateAnthropicToOpenAISSE(event, model)
-            if (openaiChunk) {
-              controller.enqueue(encoder.encode(openaiChunk))
+            if (!openaiChunk) continue
+            if (includeUsage && openaiChunk === DONE_SENTINEL) {
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({
+                    id: `chatcmpl-${Date.now().toString(36)}`,
+                    object: 'chat.completion.chunk',
+                    created: Math.floor(Date.now() / 1000),
+                    model,
+                    choices: [],
+                    usage: toOpenAIChatUsage(usage.snapshot()),
+                  })}\n\n`,
+                ),
+              )
             }
+            controller.enqueue(encoder.encode(openaiChunk))
           }
         } catch (err: any) {
           console.error('SSE transformation failed:', err)
@@ -258,6 +298,9 @@ export class ChatIngressAdapter implements IngressAdapter {
     })
   }
 }
+
+// 流结束哨兵。单独抽出来是因为调用方要在它之前插 usage chunk，靠字符串相等来认。
+const DONE_SENTINEL = 'data: [DONE]\n\n'
 
 // Helper: translate Anthropic event to OpenAI completions delta
 function translateAnthropicToOpenAISSE(event: { event?: string; data: string }, model: string): string | null {
@@ -316,7 +359,7 @@ function translateAnthropicToOpenAISSE(event: { event?: string; data: string }, 
     }
 
     if (payload.type === 'message_stop') {
-      return 'data: [DONE]\n\n'
+      return DONE_SENTINEL
     }
   } catch {}
   return null

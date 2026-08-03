@@ -11,6 +11,7 @@ import { createOpenaiCompatProvider } from './providers/openai_compat_provider.j
 import { createCodexProvider } from './providers/codex_provider.js'
 import { createAntigravityProvider, ANTIGRAVITY_DEFAULT_MODEL } from './providers/antigravity_provider.js'
 import { createAnthropicPassthroughProvider } from './providers/anthropic_passthrough_provider.js'
+import { resolveDeepSeekRoute, hasDeepSeekPlatformPrefix } from './deepseek_routes.js'
 import { detectLocalCredits, type CustomTokens } from './auth.js'
 
 export interface PickProviderOpts {
@@ -47,7 +48,8 @@ export function resolveModel(
   // 「思考」escalation lifts a LOWER flash gear to the high flash gear. It must never
   // touch a Pro pick — that's a bigger model, not a budget tier;
   // escalating it to a flash gear would be a DOWNGRADE.
-  const isLowerFlashGear = /flash/i.test(m) && m !== HIGH_GEAR
+  const isDeepSeekModel = /(?:^|\/)deepseek-/i.test(m)
+  const isLowerFlashGear = /flash/i.test(m) && m !== HIGH_GEAR && !isDeepSeekModel
   if (isLowerFlashGear && THINK_TRIGGER.test(userText)) {
     return { model: HIGH_GEAR, escalated: true }
   }
@@ -137,27 +139,32 @@ export function pickWireProvider(opts: PickProviderOpts): WireProvider | null {
     })
   }
 
-  // 2.4 百炼 (Alibaba Bailian / DashScope) — deepseek-v4-flash ONLY, and checked on an
-  // EXPLICIT model-id match ahead of the Claude/Codex credential-presence branches below.
-  // Those branches route any unmatched model to whatever credential happens to be locally
-  // configured (e.g. any model name falls through to Codex if a ChatGPT session exists) —
-  // that's fine for them, but wrong here: this route must claim deepseek-v4-flash and
-  // ONLY deepseek-v4-flash, never let another provider silently absorb it and never let
-  // this route silently absorb another model ("其他都不要进来污染"). DASHSCOPE_MODEL can
-  // override the exact deployed id (DashScope reserves the right to rev dates, e.g.
-  // -0731), but the match stays anchored to the deepseek-v4-flash family.
-  const BAILIAN_MODEL_RE = /^deepseek-v4-flash/i
-  if (BAILIAN_MODEL_RE.test(modelLower)) {
+  // 2.4 DeepSeek: a bare supported id defaults to the official Anthropic API.
+  //    Prefixes make the platform explicit:
+  //      official/deepseek-v4-flash       -> api.deepseek.com/anthropic
+  //      bailian/deepseek-v4-flash-0731   -> DashScope OpenAI-compatible API
+  //    The official API calls the current Flash weights "deepseek-v4-flash";
+  //    "DeepSeek-V4-Flash-0731" is the model-version label in the docs, not
+  //    an accepted official API model id.
+  const deepseekRoute = resolveDeepSeekRoute(opts.model ?? '')
+  if (deepseekRoute || hasDeepSeekPlatformPrefix(opts.model ?? '')) {
+    if (!deepseekRoute) {
+      throw new Error(`Invalid DeepSeek platform/model id: ${opts.model ?? ''}`)
+    }
+    if (deepseekRoute.platform === 'official') {
+      return createAnthropicPassthroughProvider({
+        baseURL: process.env.DEEPSEEK_ANTHROPIC_BASE_URL ?? 'https://api.deepseek.com/anthropic',
+        apiKey: process.env.DEEPSEEK_API_KEY ?? opts.apiKey ?? '',
+        model: deepseekRoute.model,
+        inboundBeta: opts.inboundBeta,
+      })
+    }
     return createOpenaiCompatProvider({
       baseURL: process.env.DASHSCOPE_BASE_URL ?? 'https://dashscope.aliyuncs.com/compatible-mode/v1',
       apiKey: process.env.DASHSCOPE_API_KEY ?? opts.apiKey ?? '',
-      model: process.env.DASHSCOPE_MODEL ?? opts.model ?? 'deepseek-v4-flash-0731',
-      // deepseek-v4-flash accepts image_url in the request schema without erroring, but the
-      // model has no vision capability — it silently ignores the image and replies "I don't
-      // see an image" (verified live against the DashScope compat endpoint). Gate images off
-      // so the provider degrades them to a text placeholder instead of wasting tokens on
-      // base64 the model can't use.
+      model: process.env.DASHSCOPE_MODEL ?? deepseekRoute.model,
       supportsImages: false,
+      ignoreEnvironmentModel: true,
     })
   }
 

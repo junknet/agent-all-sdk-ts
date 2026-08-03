@@ -6,9 +6,36 @@ export interface ModelInfo {
   id: string
   name: string
   supportsImages?: boolean
+  supportsTools?: boolean
   supportsThinking?: boolean
+  thinkingEfforts?: ThinkingEffort[]
+  defaultThinkingEffort?: ThinkingEffort
+  canDisableThinking?: boolean
+  contextWindow?: number
   maxOutputTokens?: number
 }
+
+export type ThinkingEffort = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+
+/**
+ * Provider-neutral reasoning intent.  This is deliberately not an Anthropic
+ * `thinking` object: some callers express a semantic tier while Anthropic and
+ * Gemini express a numeric budget.  Keeping the original representation makes
+ * conversion an egress concern instead of a lossy ingress side effect.
+ */
+export type ReasoningIntent =
+  | { readonly mode: 'disabled'; readonly source: 'client' | 'gateway-default' }
+  | { readonly mode: 'auto'; readonly source: 'client' | 'gateway-default' }
+  | {
+      readonly mode: 'effort'
+      readonly effort: ThinkingEffort
+      readonly source: 'client' | 'gateway-default'
+    }
+  | {
+      readonly mode: 'budget'
+      readonly budgetTokens: number
+      readonly source: 'client' | 'gateway-default'
+    }
 
 export interface QuotaInfo {
   tier?: string
@@ -56,6 +83,9 @@ export interface AnthropicMessagesRequest {
   top_k?: number
   stop_sequences?: string[]
   stream?: boolean
+  /** Canonical, provider-neutral reasoning intent used after ingress decoding. */
+  reasoning?: ReasoningIntent
+  /** Anthropic wire input only; ingress normalizes it into `reasoning`. */
   thinking?: { type: 'enabled' | 'disabled'; budget_tokens?: number }
   metadata?: Record<string, unknown>
   [key: string]: unknown

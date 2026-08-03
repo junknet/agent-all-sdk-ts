@@ -9,8 +9,10 @@ import type {
   ModelInfo,
   QuotaInfo,
 } from '../types.js'
+import { parseAnthropicThinking, toAnthropicThinking } from '../thinking.js'
 import type { AnthropicEventEmitter } from '../emitter.js'
 import type { TokenSource } from '../auth.js'
+import { reconcileThinkingSampling } from '../anthropic_constraints.js'
 
 export interface AnthropicPassthroughOpts {
   baseURL: string
@@ -56,6 +58,26 @@ function stripUnsupportedCacheScope<T>(system: T): T {
     const { scope: _drop, ...rest } = cc
     return { ...(b as object), cache_control: rest }
   }) as unknown as T
+}
+
+// 有的模型不接受**显式关闭**思考：claude-fable-5 收到 thinking:{type:'disabled'} 直接
+// 400 "\"thinking.type.disabled\" is not supported for this model. Thinking defaults to
+// adaptive mode when not specified"(实测 2026-08-03；同一时刻 claude-opus-5 /
+// claude-sonnet-5 / claude-opus-4-8 都接受)。而网关把 reasoning_effort=none/off 一律
+// 翻成 thinking:{type:'disabled'}，于是"在 fable 上关思考"这个动作必死。
+// 上游明说了"不指定就是 adaptive"，所以降级办法是**整个删掉 thinking 字段**：达不到
+// 客户端要的"完全不思考"，但请求能过——和同文件里 stripUnsupportedCacheScope 一个路子，
+// 降级好过整轮 400。模型目录侧同步把 canDisableThinking 改成 false，别再对外撒谎。
+const NO_EXPLICIT_THINKING_DISABLE = new Set(['claude-fable-5'])
+
+function stripUnsupportedThinkingDisable<T extends { thinking?: { type?: string } }>(
+  body: T,
+  model: string,
+): T {
+  if (body.thinking?.type !== 'disabled') return body
+  if (!NO_EXPLICIT_THINKING_DISABLE.has(model)) return body
+  const { thinking: _drop, ...rest } = body
+  return rest as T
 }
 
 function mergeBeta(inbound: string | undefined): string {
@@ -114,9 +136,21 @@ export function createAnthropicPassthroughProvider(
     name: 'anthropic-passthrough',
 
     async buildRequest(req: AnthropicMessagesRequest): Promise<WirePreparedRequest> {
-      const body = {
-        ...req,
-        model: opts.model || req.model,
+      const { reasoning, thinking: legacyThinking, ...requestWithoutReasoning } = req
+      // Direct provider callers may still hand us an Anthropic wire object. The
+      // ingress path always supplies `reasoning`; this fallback keeps the public
+      // provider factory backwards compatible without leaking the legacy field.
+      const thinking = toAnthropicThinking(reasoning ?? parseAnthropicThinking(legacyThinking))
+      const wireRequest: AnthropicMessagesRequest = {
+        ...requestWithoutReasoning,
+        ...(thinking ? { thinking } : {}),
+      }
+      // Thinking 与采样参数的冲突多半是网关自己注入的，在发出去之前收掉。
+      reconcileThinkingSampling(wireRequest)
+      const targetModel = opts.model || req.model || ''
+      const body = stripUnsupportedThinkingDisable({
+        ...wireRequest,
+        model: targetModel,
         // 本 provider 的 parseStream 是纯 SSE 转发(emitRawChunk)。入口若没显式要
         // stream，上游会回单个 JSON 对象，SSE 解析器一个事件都取不到 → 下游收到
         // 空流(只有 message_delta + message_stop，usage 0/0)。codex/antigravity
@@ -125,7 +159,7 @@ export function createAnthropicPassthroughProvider(
         ...(isOAuth
           ? { system: stripUnsupportedCacheScope(withClaudeCodeIdentity(req.system)) }
           : { system: stripUnsupportedCacheScope(req.system) }),
-      }
+      }, targetModel)
       const key = await resolveKey()
       return {
         url: messagesUrl(),
