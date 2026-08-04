@@ -1,0 +1,1 @@
+First fixture file. Its color is amber.

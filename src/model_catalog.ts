@@ -101,33 +101,156 @@ export function buildAvailableModelCatalog(sources: CatalogSources): ModelInfo[]
     .map(toModelInfo)
 }
 
-async function isolateCatalog(
-  source: CatalogSource | 'ccr',
-  load: () => Promise<readonly ModelInfo[]>,
-): Promise<readonly ModelInfo[]> {
-  try {
-    return await load()
-  } catch (error: any) {
-    console.error(`listModels ${source} failed:`, error?.message ?? error)
-    return []
+export type CatalogDiscoverySource = CatalogSource | 'ccr' | 'openai_compat'
+
+export const MODEL_CATALOG_DISCOVERY_TIMEOUT_MS = 5_000
+export const MODEL_CATALOG_SUCCESS_TTL_MS = 15_000
+export const MODEL_CATALOG_FAILURE_TTL_MS = 5_000
+
+export interface ProviderCatalogCacheOptions {
+  readonly now?: () => number
+  readonly discoveryTimeoutMs?: number
+  readonly successTtlMs?: number
+  readonly failureTtlMs?: number
+  readonly reportFailure?: (source: CatalogDiscoverySource, error: unknown) => void
+}
+
+export interface ProviderCatalogCache {
+  load(
+    source: CatalogDiscoverySource,
+    discover: () => Promise<readonly ModelInfo[]>,
+  ): Promise<readonly ModelInfo[]>
+}
+
+interface CachedProviderCatalog {
+  readonly expiresAt: number
+  readonly models: readonly ModelInfo[]
+}
+
+function nonNegativeMilliseconds(value: number, name: string): number {
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`${name} must be a finite, non-negative number of milliseconds`)
+  }
+  return value
+}
+
+function positiveMilliseconds(value: number, name: string): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`${name} must be a finite, positive number of milliseconds`)
+  }
+  return value
+}
+
+function withDiscoveryTimeout<T>(
+  source: CatalogDiscoverySource,
+  timeoutMs: number,
+  discover: () => Promise<T>,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`model catalog discovery for ${source} timed out after ${timeoutMs}ms`))
+    }, timeoutMs)
+
+    Promise.resolve()
+      .then(discover)
+      .then(resolve, reject)
+      .finally(() => clearTimeout(timer))
+  })
+}
+
+/**
+ * Bounds each provider discovery and remembers both usable and failed snapshots.
+ *
+ * The cache is an instance rather than a module-global test hook: production owns
+ * one instance below, while each test can provide its own clock and cache state.
+ */
+export function createProviderCatalogCache(options: ProviderCatalogCacheOptions = {}): ProviderCatalogCache {
+  const now = options.now ?? Date.now
+  const discoveryTimeoutMs = positiveMilliseconds(
+    options.discoveryTimeoutMs ?? MODEL_CATALOG_DISCOVERY_TIMEOUT_MS,
+    'discoveryTimeoutMs',
+  )
+  const successTtlMs = nonNegativeMilliseconds(
+    options.successTtlMs ?? MODEL_CATALOG_SUCCESS_TTL_MS,
+    'successTtlMs',
+  )
+  const failureTtlMs = nonNegativeMilliseconds(
+    options.failureTtlMs ?? MODEL_CATALOG_FAILURE_TTL_MS,
+    'failureTtlMs',
+  )
+  const reportFailure = options.reportFailure ?? ((source: CatalogDiscoverySource, error: unknown) => {
+    const message = error instanceof Error ? error.message : error
+    console.error(`listModels ${source} failed:`, message)
+  })
+  const cached = new Map<CatalogDiscoverySource, CachedProviderCatalog>()
+  const pending = new Map<CatalogDiscoverySource, Promise<readonly ModelInfo[]>>()
+
+  return {
+    async load(source, discover) {
+      const previous = cached.get(source)
+      if (previous && previous.expiresAt > now()) return previous.models
+
+      const inFlight = pending.get(source)
+      if (inFlight) return inFlight
+
+      const refresh = withDiscoveryTimeout(source, discoveryTimeoutMs, discover)
+        .then(models => {
+          cached.set(source, { models, expiresAt: now() + successTtlMs })
+          return models
+        })
+        .catch(error => {
+          reportFailure(source, error)
+          const unavailable: readonly ModelInfo[] = []
+          cached.set(source, { models: unavailable, expiresAt: now() + failureTtlMs })
+          return unavailable
+        })
+      pending.set(source, refresh)
+
+      try {
+        return await refresh
+      } finally {
+        if (pending.get(source) === refresh) pending.delete(source)
+      }
+    },
   }
 }
 
+const providerCatalogCache = createProviderCatalogCache()
+
+async function isolateCatalog(
+  source: CatalogDiscoverySource,
+  load: () => Promise<readonly ModelInfo[]>,
+): Promise<readonly ModelInfo[]> {
+  return providerCatalogCache.load(source, load)
+}
+
+const truthy = (v: string | undefined): boolean => !!v && !['0', 'false', 'no', ''].includes(v.toLowerCase())
+
 /** Query independent provider catalogs concurrently, then apply gateway policy. */
 export async function listAvailableModels(): Promise<ModelInfo[]> {
-  if (process.env.FORCE_OPENAI_COMPAT === '1') {
+  if (truthy(process.env.FORCE_OPENAI_COMPAT)) {
+    const forcedModel = process.env.OPENAI_MODEL ?? process.env.OPENAI_COMPAT_MODEL
     const provider = createOpenaiCompatProvider({
       baseURL: process.env.OPENAI_BASE_URL ?? '',
       apiKey: process.env.OPENAI_API_KEY ?? '',
-      model: '',
+      model: forcedModel ?? '',
       authScheme: process.env.OPENAI_COMPAT_AUTH_SCHEME === 'x-api-key' ? 'x-api-key' : 'bearer',
     })
-    const models = (await provider.listModels?.()) ?? []
-    // A generic forced egress only speaks Chat Completions, so do not advertise
-    // models whose upstream admission requires Messages or Responses.
-    return models.filter(model =>
+    const fetched = await isolateCatalog('openai_compat', async () => (await provider.listModels?.()) ?? [])
+    const models = fetched.filter(model =>
       model.clientProtocol === undefined || model.clientProtocol === 'openai_chat_completions',
     )
+    if (forcedModel && !models.some(m => m.id === forcedModel)) {
+      models.unshift({
+        id: forcedModel,
+        name: forcedModel,
+        contextWindow: 1048576,
+        maxOutputTokens: 128000,
+        supportsTools: true,
+        supportsImages: true,
+      })
+    }
+    return models
   }
 
   const credits = detectLocalCredits()

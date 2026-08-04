@@ -43,6 +43,10 @@ function identifyClient(
 }
 
 const PORT = Number(process.env.AGENT_GATEWAY_PORT ?? 8085)
+// Set only by the real-agent gate.  A nonce, rather than an ordinary 200 health
+// response, proves that the harness reached the process it just launched and
+// not an unrelated gateway already bound to the selected port.
+const AGENT_GATEWAY_READY_NONCE = process.env.AGENT_GATEWAY_READY_NONCE
 
 // ── HTTP Gateway Server ─────────────────────────────────────────────
 console.log(`Starting TS Gateway Server on port ${PORT}...`)
@@ -56,6 +60,20 @@ Bun.serve({
   idleTimeout: 255,
   async fetch(req) {
     const url = new URL(req.url)
+
+    if (
+      AGENT_GATEWAY_READY_NONCE &&
+      req.method === 'GET' &&
+      url.pathname === '/__agent_gate_ready'
+    ) {
+      return new Response(AGENT_GATEWAY_READY_NONCE, {
+        headers: {
+          'Cache-Control': 'no-store',
+          'Content-Type': 'text/plain; charset=utf-8',
+          'X-Agent-Gate-Nonce': AGENT_GATEWAY_READY_NONCE,
+        },
+      })
+    }
 
     // 入口鉴权：对外暴露时校验 Bearer key。GATEWAY_API_KEY 未设则不校验（纯内网/开发）。
     const requiredKey = process.env.GATEWAY_API_KEY

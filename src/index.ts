@@ -11,6 +11,10 @@ import { createOpenaiCompatProvider } from './providers/openai_compat_provider.j
 import { createCodexProvider } from './providers/codex_provider.js'
 import { createAntigravityProvider, ANTIGRAVITY_DEFAULT_MODEL } from './providers/antigravity_provider.js'
 import { createAnthropicPassthroughProvider } from './providers/anthropic_passthrough_provider.js'
+import {
+  createWindsurfAgentIrProvider,
+  windsurfModelUid,
+} from './providers/windsurf_agent_ir_provider.js'
 import { resolveDeepSeekRoute } from './deepseek_routes.js'
 import { detectLocalCredits, type CustomTokens } from './auth.js'
 import {
@@ -50,6 +54,10 @@ export function resolveModel(
   model: string | undefined,
   userText: string,
 ): { model: string; escalated: boolean } {
+  // Windsurf is an explicit egress selector too.  Keep its uid untouched:
+  // a `windsurf-...haiku...` request must not be rewritten to Gemini before
+  // provider selection.
+  if (windsurfModelUid(model)) return { model: model ?? '', escalated: false }
   // A channel-qualified id is an explicit choice of egress, so neither the
   // haiku remap nor the 「思考」 escalation may rewrite it: silently moving
   // ccr-claude-haiku-4-5 onto a local gemini gear would bill the wrong
@@ -226,6 +234,11 @@ export async function pickRegistryWireProvider(
  * credential detection.
  */
 export async function selectWireProvider(opts: PickProviderOpts): Promise<WireProvider | null> {
+  const windsurfModel = windsurfModelUid(opts.model)
+  if (windsurfModel) {
+    return createWindsurfAgentIrProvider({ model: windsurfModel })
+  }
+
   return (
     (await pickRegistryWireProvider(opts)) ??
     (await pickCcRelayWireProvider(opts)) ??
@@ -443,7 +456,9 @@ export function createWireAdapter(
       upstream = await globalThis.fetch(prepared.url, {
         method: 'POST',
         headers: prepared.headers,
-        body: prepared.body,
+        // lib.dom from the legacy project omits Uint8Array from BodyInit;
+        // Bun fetch accepts it and Connect/protobuf requires those raw bytes.
+        body: prepared.body as unknown as BodyInit,
       })
     } catch (err: any) {
       devlog(trace, 'error', { provider: provider.name, at: 'fetch', message: String(err?.message ?? err) })
@@ -479,7 +494,7 @@ export function createWireAdapter(
           attemptResp = await globalThis.fetch(prepared.url, {
             method: 'POST',
             headers: prepared.headers,
-            body: prepared.body,
+            body: prepared.body as unknown as BodyInit,
           })
         } catch (err: any) {
           devlog(trace, 'error', { at: 'retry_fetch', attempt, message: String(err?.message ?? err) })
@@ -538,11 +553,12 @@ export function createWireAdapter(
   }
 }
 
-function safeParseJSON(s: string): unknown {
+function safeParseJSON(body: string | Uint8Array): unknown {
+  if (body instanceof Uint8Array) return `<binary ${body.byteLength} bytes>`
   try {
-    return JSON.parse(s)
+    return JSON.parse(body)
   } catch {
-    return s
+    return body
   }
 }
 

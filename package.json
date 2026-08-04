@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "test": "bun test"
+    "test": "bun test test/*.test.ts",
+    "test:agent": "bash scripts/run_omp_agent_gate.sh"
   },
   "devDependencies": {
     "@types/bun": "^1.3.14",

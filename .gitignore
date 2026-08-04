@@ -10,3 +10,5 @@ Thumbs.db
 *.bak
 .code-explore/
 .playwright-mcp/
+__pycache__/
+tmp/

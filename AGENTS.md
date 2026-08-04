@@ -17,7 +17,7 @@ This repository contains the **Agent All SDK**, a TypeScript-based gateway adapt
 The project uses **Bun** as its primary runtime, package manager, and test runner.
 
 - `bun install`: Install project dependencies.
-- `bun test`: Run all tests in the `test/` directory.
+- `bun run test`: Run this repository's tests in the `test/` directory.
 - `bun run src/server.ts`: Start the gateway server locally.
 
 ## Coding Style & Naming Conventions
@@ -40,4 +40,4 @@ Follow the "coder-style" principles to minimize inference distance for both huma
 
 - **Atomic Commits**: Keep commits small and focused on a single logical change.
 - **Messages**: Use descriptive, imperative-mood messages (e.g., "Add Antigravity provider support").
-- **PRs**: Ensure `bun test` passes before opening a pull request. Include a description of the change and any relevant test evidence.
+- **PRs**: Ensure `bun run test` passes before opening a pull request. For real agent changes, run the gate documented in README's “运行 / 验收” section. Include a description of the change and relevant test evidence.

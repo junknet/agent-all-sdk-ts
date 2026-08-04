@@ -435,13 +435,17 @@ export function detectLocalCredits(opts?: { customTokens?: CustomTokens }): Cred
   } else if (process.env.GATEWAY_CLAUDE_ACCESS_TOKEN || process.env.GATEWAY_CLAUDE_TOKEN) {
     const source = new MemoryTokenSource('claude', process.env.GATEWAY_CLAUDE_ACCESS_TOKEN || process.env.GATEWAY_CLAUDE_TOKEN || '', process.env.GATEWAY_CLAUDE_REFRESH_TOKEN)
     credits.push({ provider: 'claude', type: 'oauth', source })
-  } else if (process.env.ANTHROPIC_API_KEY) {
-    credits.push({ provider: 'claude', type: 'api_key', value: process.env.ANTHROPIC_API_KEY })
   } else {
     try {
       const claudeSource = new ClaudeOAuthSource()
       credits.push({ provider: 'claude', type: 'oauth', source: claudeSource })
-    } catch {}
+    } catch {
+      // 环境 API key 是本地登录态不存在时的兼容回退；不能让遗留/失效 key
+      // 遮蔽已登录且可刷新的 Claude Code 凭据。
+      if (process.env.ANTHROPIC_API_KEY) {
+        credits.push({ provider: 'claude', type: 'api_key', value: process.env.ANTHROPIC_API_KEY })
+      }
+    }
   }
 
   // --- Codex / OpenAI ---
@@ -451,9 +455,6 @@ export function detectLocalCredits(opts?: { customTokens?: CustomTokens }): Cred
   } else if (process.env.GATEWAY_CODEX_ACCESS_TOKEN || process.env.GATEWAY_CODEX_TOKEN) {
     const source = new MemoryTokenSource('codex', process.env.GATEWAY_CODEX_ACCESS_TOKEN || process.env.GATEWAY_CODEX_TOKEN || '', process.env.GATEWAY_CODEX_REFRESH_TOKEN)
     credits.push({ provider: 'codex', type: 'oauth', source })
-  } else if (process.env.OPENAI_API_KEY || process.env.CODEX_API_KEY) {
-    const key = process.env.OPENAI_API_KEY || process.env.CODEX_API_KEY
-    credits.push({ provider: 'codex', type: 'api_key', value: key })
   } else {
     try {
       const codexSource = new CodexOAuthSource()
@@ -463,7 +464,11 @@ export function detectLocalCredits(opts?: { customTokens?: CustomTokens }): Cred
         source: codexSource,
         accountId: codexSource.accountId(),
       })
-    } catch {}
+    } catch {
+      // 同 Claude：本机 ChatGPT/Codex 登录态优先，环境 key 只作回退。
+      const key = process.env.OPENAI_API_KEY || process.env.CODEX_API_KEY
+      if (key) credits.push({ provider: 'codex', type: 'api_key', value: key })
+    }
   }
 
   // --- Gemini direct API key or OAuth Token ---

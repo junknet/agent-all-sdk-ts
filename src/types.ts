@@ -1,6 +1,6 @@
 import type { AnthropicEventEmitter } from './emitter.js'
 
-export type WireProviderName = 'antigravity' | 'openai-compat' | 'codex' | 'anthropic-passthrough'
+export type WireProviderName = 'antigravity' | 'openai-compat' | 'codex' | 'anthropic-passthrough' | 'windsurf'
 
 export type ClientProtocol =
   | 'anthropic_messages'
@@ -136,7 +136,8 @@ export interface IRLoss {
 export interface WirePreparedRequest {
   url: string
   headers: Record<string, string>
-  body: string
+  /** JSON 出口用 string；Connect/protobuf 等二进制出口必须原样交给 fetch。 */
+  body: string | Uint8Array
   /**
    * 本次 egress 翻译丢掉的东西。调用方(createWireAdapter)持有 trace，负责逐条落盘 ——
    * provider 自己没有 trace，把 loss 带出去比在 provider 里硬凑一个日志上下文干净。

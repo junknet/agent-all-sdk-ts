@@ -4,8 +4,7 @@ import { createCodexProvider } from '../src/providers/codex_provider.js'
 import { createOpenaiCompatProvider } from '../src/providers/openai_compat_provider.js'
 import { toolResultToResponse } from '../src/providers/antigravity_provider.js'
 import { createAntigravityProvider } from '../src/providers/antigravity_provider.js'
-import { pickWireProvider } from '../src/index.js'
-import { createCodexProvider } from '../src/providers/codex_provider.js'
+import { selectWireProvider } from '../src/index.js'
 
 function sseData(payload: unknown): string {
   return `data: ${JSON.stringify(payload)}\n\n`
@@ -252,7 +251,7 @@ test('forced compatible multi-model mode preserves the selected model', async ()
     process.env.OPENAI_MODEL = 'unrelated-default'
     process.env.OPENAI_COMPAT_MODEL = 'another-unrelated-default'
 
-    const provider = pickWireProvider({ model: 'glm-5-2' })
+    const provider = await selectWireProvider({ model: 'glm-5-2' })
     const request = await provider!.buildRequest({
       model: 'glm-5-2',
       messages: [{ role: 'user', content: 'hello' }],

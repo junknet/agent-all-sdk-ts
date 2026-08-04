@@ -15,7 +15,8 @@ Gemini** 各家，用 **Anthropic 格式作为统一中间表示（canonical IR�
   ├ POST /v1/messages   ┐                    ┌ anthropic-passthrough (Claude)
   ├ POST /v1/chat/...   ┼─ decode ─► Anthropic ─ encode ─┼ codex (ChatGPT Responses)
   └ POST /v1/responses  ┘          canonical          ├ openai-compat (OpenAI/Gemini-OAI)
-                                                       └ antigravity (Gemini CloudCode)
+                                                       ├ antigravity (Gemini CloudCode)
+                                                       └ windsurf → agent-ir (Connect/protobuf)
 ```
 
 - IR = Anthropic Messages 格式（注释里称 `Anthropic-canonical`）。
@@ -40,7 +41,8 @@ src/
    ├ antigravity_provider.ts        ── Gemini via Google CloudCode
    ├ codex_provider.ts              ── ChatGPT Codex Responses
    ├ openai_compat_provider.ts      ── OpenAI Chat Completions / Gemini-OAI
-   └ anthropic_passthrough_provider.ts ── Claude（OAuth / API key 直透）
+   ├ anthropic_passthrough_provider.ts ── Claude（OAuth / API key 直透）
+   └ windsurf_agent_ir_provider.ts  ── Windsurf Connect/protobuf（由 agent-ir lower/lift）
 ```
 
 **import 方向（单向，无环）**：`types` ← 所有；`emitter/sse/auth` ← `providers`；
@@ -68,6 +70,12 @@ src/
 - 官方配置：`DEEPSEEK_API_KEY`，可用 `DEEPSEEK_ANTHROPIC_BASE_URL` 覆盖 Anthropic
   兼容入口。官方透传原生 Anthropic 请求，不经过 OpenAI schema 转换。
 - 两个平台都关闭了本路由的「思考升档」改写，避免 DeepSeek 请求被误改成 Gemini。
+- **Windsurf（显式路由）**：请求 `model` 写作 `windsurf-<chat_model_uid>`，例如
+  `windsurf-claude-sonnet-5-medium`。该前缀不会被模型重映射或思考升档改写；网关通过
+  `agent-ir` 生成 `application/connect+proto` 二进制请求并把响应提升回 Anthropic SSE。
+  部署时设置 `WINDSURF_API_KEY`（可选 `WINDSURF_SERVER_URL`）；仅本机开发时可回退读取
+  Devin/Windsurf CLI 的凭据文件。此路由不进入 `/v1/models` 自动目录，避免将瞬时账号可用模型
+  当作静态承诺发布。
 
 ## 模型发现（`GET /v1/models`）
 
@@ -104,7 +112,23 @@ stock OMP 只直接读取发现响应中的 `id/name/supported_endpoint_types/co
 ```bash
 bun install
 bun run src/server.ts          # 默认 :8085（AGENT_GATEWAY_PORT 可改）
-bun test                       # wire 契约 + 升档状态机 + 签名 lockstep + E2E（有凭据才跑对应后端）
+bun run test                   # 仅执行本仓库 test/；避免临时第三方源码被 Bun 递归发现
+bun run test:agent             # OMP 三轮目录/文件/图片真实工具门控（需要本机 OMP + Claude OAuth）
+```
+
+`test:agent` 会启动隔离 Gateway、使用本机 OMP 登录态完成同一会话中的目录、文件和图片三轮工具
+调用，并核验持久化 trace。它要求 `${OMP_SOURCE_AGENT_DIR:-~/.omp/agent}` 中存在 `config.yml` /
+`models.yml`，后者包含唯一的 `http://localhost:8085/v1`，且本机 Claude OAuth 可用；因此不放入默认
+单元测试命令。
+
+三出口的两轮 `tool_use → tool_result` 实测使用独立终端启动 Gateway 后执行：
+
+```bash
+# 终端一
+AGENT_GATEWAY_PORT=8103 bun run src/server.ts
+
+# 终端二（Windsurf、Claude、Codex 本地凭据均需可用）
+AGENT_GATEWAY_BASE_URL=http://127.0.0.1:8103 bun scripts/real_agent_tool_loop.ts
 ```
 
 若 cc-relay 的 `/v1/models` 为每个模型给出 `client_protocol`，可让三种入口按模型转换为
@@ -117,7 +141,7 @@ ANTHROPIC_API_KEY=<client-api-key>
 CC_RELAY_PROTOCOL_AWARE=1
 ```
 
-启动器会显式加载该文件；它不在仓库内，也不会污染 `bun test`。该模式以 `x-api-key`
+启动器会显式加载该文件；它不在仓库内，也不会污染 `bun run test`。该模式以 `x-api-key`
 读取中转模型目录，并按目录声明出站：`anthropic_messages` → `/v1/messages`，
 `openai_chat_completions` → `/v1/chat/completions`，`openai_responses` → `/v1/responses`。
 模型名称保持客户端选择的原值；未在目录发布或未声明协议的模型会明确拒绝，不猜测路由。
