@@ -1,4 +1,19 @@
-/** DeepSeek model routing for the official and Bailian platforms. */
+/**
+ * Legacy bare-id DeepSeek routing.
+ *
+ * The public catalog no longer contains any of these ids: every published
+ * DeepSeek model is channel-qualified (`official-deepseek-v4-pro`,
+ * `bailian-deepseek-v4-flash-0731`) and routed by `model_registry.ts`.
+ *
+ * What survives here is the compatibility path for clients that were never
+ * migrated and still send a bare `deepseek-*`. A bare id cannot express a
+ * platform, so it resolves to the official API — the historical behaviour.
+ * Anything wanting Bailian must name the channel.
+ *
+ * Retire this file once no client sends bare ids: the gateway logs the
+ * requested model on every inbound request (`devlog` `requested` field), so
+ * "nobody sends bare deepseek ids anymore" is checkable, not a guess.
+ */
 
 export type DeepSeekPlatform = 'official' | 'bailian'
 
@@ -8,100 +23,40 @@ export interface DeepSeekRoute {
   readonly model: string
 }
 
-export interface DeepSeekModelDescriptor extends DeepSeekRoute {
-  readonly id: string
-  readonly aliases: readonly string[]
-  readonly credentialEnvironmentVariable: 'DEEPSEEK_API_KEY' | 'DASHSCOPE_API_KEY'
-  readonly contextWindow: number
-  readonly maxOutputTokens: number
-  readonly supportsImages: boolean
-  readonly supportsTools: boolean
-  readonly supportsThinking: boolean
-  readonly thinkingEfforts: readonly ('high' | 'max')[]
-  readonly canDisableThinking: boolean
-}
-
 /**
- * Single authored DeepSeek catalog. Public discovery, aliases and upstream
- * routing are all derived from these descriptors so they cannot drift.
- */
-export const DEEPSEEK_MODEL_DESCRIPTORS: readonly DeepSeekModelDescriptor[] = [
-  {
-    id: 'official/deepseek-v4-flash',
-    aliases: ['deepseek-v4-flash', 'deepseek-chat', 'deepseek-reasoner'],
-    platform: 'official',
-    model: 'deepseek-v4-flash',
-    credentialEnvironmentVariable: 'DEEPSEEK_API_KEY',
-    contextWindow: 1_048_576,
-    maxOutputTokens: 384_000,
-    supportsImages: false,
-    supportsTools: true,
-    supportsThinking: true,
-    thinkingEfforts: ['high', 'max'],
-    canDisableThinking: true,
-  },
-  {
-    id: 'official/deepseek-v4-pro',
-    aliases: ['deepseek-v4-pro'],
-    platform: 'official',
-    model: 'deepseek-v4-pro',
-    credentialEnvironmentVariable: 'DEEPSEEK_API_KEY',
-    contextWindow: 1_048_576,
-    maxOutputTokens: 384_000,
-    supportsImages: false,
-    supportsTools: true,
-    supportsThinking: true,
-    thinkingEfforts: ['high', 'max'],
-    canDisableThinking: true,
-  },
-  {
-    id: 'bailian/deepseek-v4-flash-0731',
-    aliases: ['bailian/deepseek-v4-flash'],
-    platform: 'bailian',
-    model: 'deepseek-v4-flash-0731',
-    credentialEnvironmentVariable: 'DASHSCOPE_API_KEY',
-    contextWindow: 1_048_576,
-    maxOutputTokens: 384_000,
-    supportsImages: false,
-    supportsTools: true,
-    supportsThinking: true,
-    thinkingEfforts: ['high', 'max'],
-    canDisableThinking: false,
-  },
-] as const
-
-/** True for a model id that explicitly selects one of the two platforms. */
-export function hasDeepSeekPlatformPrefix(modelId: string): boolean {
-  return /^(?:official|bailian)\/deepseek-/i.test(modelId.trim())
-}
-
-/**
- * Resolve a DeepSeek model id. A bare supported id uses the official API.
+ * Bare aliases accepted from un-migrated clients, all on the official API.
  *
- * Unsupported V4 ids fail locally instead of falling through to another
- * credential-backed provider. Unrelated DeepSeek generations return null so
- * existing non-V4 provider routing remains unchanged.
+ * The official API calls the current Flash weights `deepseek-v4-flash`;
+ * `DeepSeek-V4-Flash-0731` is the docs' version label and is NOT an accepted
+ * official model id — it exists only on Bailian, hence only as a channel id.
+ */
+const LEGACY_BARE_ALIASES: Readonly<Record<string, string>> = {
+  'deepseek-v4-flash': 'deepseek-v4-flash',
+  'deepseek-chat': 'deepseek-v4-flash',
+  'deepseek-reasoner': 'deepseek-v4-flash',
+  'deepseek-v4-pro': 'deepseek-v4-pro',
+}
+
+/**
+ * Resolve a bare DeepSeek id to the official platform.
+ *
+ * Returns null for anything that is not a DeepSeek id at all, so unrelated
+ * models fall through to the other provider branches untouched. An
+ * unsupported DeepSeek id throws instead of silently falling through to a
+ * different credential-backed provider.
  */
 export function resolveDeepSeekRoute(modelId: string): DeepSeekRoute | null {
   const normalized = modelId.trim().toLowerCase()
-  const descriptor = DEEPSEEK_MODEL_DESCRIPTORS.find(
-    candidate => candidate.id === normalized || candidate.aliases.includes(normalized),
-  )
-  if (descriptor) return { platform: descriptor.platform, model: descriptor.model }
+  const model = LEGACY_BARE_ALIASES[normalized]
+  if (model) return { platform: 'official', model }
 
-  if (!/^(?:(?:official|bailian)\/)?deepseek-/i.test(normalized)) return null
-  const supportedIds = DEEPSEEK_MODEL_DESCRIPTORS.flatMap(candidate => [candidate.id, ...candidate.aliases])
+  if (!/^deepseek-/i.test(normalized)) return null
+  const supported = Object.keys(LEGACY_BARE_ALIASES).join(', ')
   const hint = normalized.endsWith('-0731')
-    ? " Use 'bailian/deepseek-v4-flash-0731' for the dated Bailian model."
+    ? " The dated Bailian weights are published as 'bailian-deepseek-v4-flash-0731'."
     : ''
   throw new Error(
-    `Unsupported DeepSeek model '${modelId}'. Supported ids: ${supportedIds.join(', ')}.${hint}`,
+    `Unsupported bare DeepSeek model '${modelId}'. Supported bare ids: ${supported}.` +
+      `${hint} Channel-qualified ids (official-*, bailian-*) are routed by the model registry.`,
   )
-}
-
-/** Models advertised by this gateway; no remote catalog pollution. */
-export function listDeepSeekModels(): DeepSeekModelDescriptor[] {
-  return DEEPSEEK_MODEL_DESCRIPTORS.filter(
-    descriptor => !!process.env[descriptor.credentialEnvironmentVariable],
-  ).map(descriptor => ({ ...descriptor, aliases: [...descriptor.aliases], thinkingEfforts: [...descriptor.thinkingEfforts] }))
 }

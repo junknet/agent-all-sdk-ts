@@ -169,6 +169,51 @@ describe('内容块形状', () => {
   })
 })
 
+describe('thinking budget 下限与 max_tokens 关系（上游 400 budget_tokens >= 1024）', () => {
+  const build = async (req: any): Promise<any> => {
+    const provider = createAnthropicPassthroughProvider({
+      baseURL: 'https://api.anthropic.com',
+      apiKey: 'sk-test',
+      model: 'claude-opus-5',
+    })
+    return JSON.parse((await provider.buildRequest(req)).body)
+  }
+
+  // 网关自己的 effort→budget 表把 minimal 映射成 512，低于 Anthropic 的下限，
+  // 实测 opus-5/sonnet-5/fable-5/opus-4-8 全部 400。
+  test('低于 1024 的 budget 抬到 1024 而不是丢掉 thinking', async () => {
+    const body = await build({
+      model: 'claude-opus-5',
+      max_tokens: 8192,
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'enabled', budget_tokens: 512 },
+    })
+    expect(body.thinking).toEqual({ type: 'enabled', budget_tokens: 1024 })
+  })
+
+  test('max_tokens 不大于 budget 时抬 max_tokens，而不是压回 budget', async () => {
+    const body = await build({
+      model: 'claude-opus-5',
+      max_tokens: 512,
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'enabled', budget_tokens: 512 },
+    })
+    expect(body.thinking.budget_tokens).toBe(1024)
+    expect(body.max_tokens).toBeGreaterThan(body.thinking.budget_tokens)
+  })
+
+  test('已经合法的 budget 原样放过', async () => {
+    const body = await build({
+      model: 'claude-opus-5',
+      max_tokens: 8192,
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'enabled', budget_tokens: 4096 },
+    })
+    expect(body.thinking.budget_tokens).toBe(4096)
+    expect(body.max_tokens).toBe(8192)
+  })
+})
+
 describe('thinking 与采样参数的冲突由网关自己收（是网关注入的 thinking 造成的）', () => {
   const buildBody = async (req: any, model = 'claude-opus-5'): Promise<any> => {
     const provider = createAnthropicPassthroughProvider({
@@ -273,8 +318,8 @@ describe('claude-fable-5 不支持显式关思考', () => {
       ],
     })
     const published = createModelsListResponse(catalog).data
-    const fable = published.find(m => m.id === 'claude-fable-5')
-    const opus = published.find(m => m.id === 'claude-opus-5')
+    const fable = published.find(m => m.id === 'local-claude-fable-5')
+    const opus = published.find(m => m.id === 'local-claude-opus-5')
     expect(fable?.capabilities.canDisableThinking).toBe(false)
     expect(opus?.capabilities.canDisableThinking).toBe(true)
   })

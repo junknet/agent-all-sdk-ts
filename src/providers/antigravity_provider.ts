@@ -375,10 +375,15 @@ export function createAntigravityProvider(opts: AntigravityOpts): WireProvider {
       let hadTools = false
       let lastFinishReason = ''
       let thinkingBuf = ''
+      // Gemini 流的终止信号就是 candidate.finishReason；一个都没等到 = 流被掐断。
+      let sawTerminal = false
 
       for await (const evt of iterSSE(response)) {
         const chunk = tryParseJSON<any>(evt.data)
-        if (!chunk) continue
+        if (!chunk) {
+          emitter.unhandled(evt.event ?? '<unparseable>', evt.data)
+          continue
+        }
 
         const usage = chunk.response?.usageMetadata
         if (usage) {
@@ -399,8 +404,20 @@ export function createAntigravityProvider(opts: AntigravityOpts): WireProvider {
         }
 
         const candidates = chunk.response?.candidates
-        if (!Array.isArray(candidates) || candidates.length === 0) continue
+        if (!Array.isArray(candidates) || candidates.length === 0) {
+          // 纯 usageMetadata 的块是合法的；两样都没有说明上游换了形状，不能静默吞掉。
+          if (!usage) emitter.unhandled('<no-candidates>', chunk)
+          continue
+        }
         const candidate = candidates[0]
+        // 终止判定必须在 parts 守卫**之前**：实测 2026-08-01..04 网关日志里 1713 个带
+        // finishReason 的 candidate 全部同时带 parts，所以提前读对出站字节流零影响
+        // (closeBlock 仍留在 parts 循环之后的原位置)；但守卫在前的话，上游将来一旦发出
+        // 「只有 finishReason、没有 content」的收尾块，就会被 continue 掉，白白当成掐断。
+        if (candidate?.finishReason) {
+          lastFinishReason = candidate.finishReason
+          sawTerminal = true
+        }
         const parts = candidate?.content?.parts
         if (!Array.isArray(parts)) continue
 
@@ -425,11 +442,16 @@ export function createAntigravityProvider(opts: AntigravityOpts): WireProvider {
             if (text) { emitter.pushThinking(text); thinkingBuf += text }
           } else if (typeof part.text === 'string') {
             emitter.pushTextAccumulated(part.text)
+          } else {
+            // 实测的 part 只有五种形状，全部被上面接住了：{text} 6994 /
+            // {functionCall,thoughtSignature} 1283 / {text,thought} 567 /
+            // {text,thoughtSignature} 343 / {functionCall} 4。落到这里的是上游新加的
+            // 形状(如 inlineData 图片输出)，此前会被 for 循环无声跳过。
+            emitter.unhandled('<gemini-part>', part)
           }
         }
 
         if (candidate.finishReason) {
-          lastFinishReason = candidate.finishReason
           emitter.closeBlock()
         }
       }
@@ -455,6 +477,16 @@ export function createAntigravityProvider(opts: AntigravityOpts): WireProvider {
         emitter.setStopReason('end_turn')
       }
 
+      // 一个 finishReason 都没见过 = 上游把流掐了。此前照样 finish()，产出
+      // stop_reason:'end_turn' 的正常收尾，客户端无从分辨截断与真结束。
+      if (!sawTerminal) {
+        emitter.error({
+          type: 'api_error',
+          message:
+            '[gateway] antigravity upstream stream ended without a finishReason; ' +
+            'the turn is truncated',
+        })
+      }
       emitter.finish()
     },
 

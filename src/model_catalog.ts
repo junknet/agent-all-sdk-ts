@@ -1,27 +1,28 @@
 import { detectLocalCredits } from './auth.js'
-import { listDeepSeekModels } from './deepseek_routes.js'
 import { createAnthropicPassthroughProvider } from './providers/anthropic_passthrough_provider.js'
 import {
   createAntigravityProvider,
   ANTIGRAVITY_DEFAULT_MODEL,
-  ANTIGRAVITY_MODEL_META,
-  resolveAntigravityModel,
 } from './providers/antigravity_provider.js'
 import { createCodexProvider } from './providers/codex_provider.js'
 import { createOpenaiCompatProvider } from './providers/openai_compat_provider.js'
 import type { ModelInfo, ThinkingEffort } from './types.js'
 import { isCcRelayProtocolAware, listCcRelayModels } from './cc_relay.js'
+import {
+  listRegistry,
+  toModelInfo,
+  type RegistryEntry,
+  type RegistrySource,
+} from './model_registry.js'
 
-type CatalogSource = 'antigravity' | 'codex' | 'claude'
-
-interface PublicModelPolicy extends Omit<ModelInfo, 'name'> {
-  readonly source: CatalogSource
-}
+type CatalogSource = RegistrySource
 
 export interface CatalogSources {
   readonly antigravity: readonly ModelInfo[]
   readonly codex: readonly ModelInfo[]
   readonly claude: readonly ModelInfo[]
+  /** Relay-published ids, absent when cc-relay egress is not configured. */
+  readonly ccr?: readonly ModelInfo[]
 }
 
 export interface GatewayModelCapabilities {
@@ -53,155 +54,55 @@ export interface GatewayModelsList {
   readonly data: readonly GatewayModelObject[]
 }
 
-const COMMON_REASONING_EFFORTS: readonly ThinkingEffort[] = [
-  'minimal',
-  'low',
-  'medium',
-  'high',
-  'xhigh',
-  'max',
-]
-
-function antigravityMaxOutputTokens(publicModelId: string): number {
-  const route = resolveAntigravityModel(publicModelId)
-  const maxOutputTokens = ANTIGRAVITY_MODEL_META[route]?.maxOutputTokens
-  if (!maxOutputTokens) {
-    throw new Error(`No Antigravity route metadata for public model: ${publicModelId}`)
-  }
-  return maxOutputTokens
-}
-
-/**
- * Public gateway catalog policy. Provider catalogs only prove availability;
- * they never decide which legacy/internal models this gateway advertises.
- *
- * ── contextWindow 的取证状态（2026-08-03，未改数值，只记账）────────────────
- * 下游 harness 拿 context_length 算压缩阈值(70% 触发)，报大了就压得太晚。三家的
- * 一手证据如下，其中 codex 一档拿不到确证，所以整表**维持现状 1_048_576 不动**，
- * 等一手数字齐了再一起改：
- *
- *   gemini-3.6-flash-*  1_048_576  ✅ 与声明一致
- *       来源：cloudcode-pa `v1internal:fetchAvailableModels` 的 `maxTokens` 字段
- *       (实测直接打该端点，三个档位都回 1048576 / maxOutputTokens 65536)。
- *
- *   claude-*            1_000_000  ⚠ 声明 1_048_576，超报 4.9%
- *       来源：`GET api.anthropic.com/v1/models` 的 `max_input_tokens`
- *       (opus-5 / sonnet-5 / fable-5 / opus-4-8 全是 1000000，max_tokens 128000)。
- *
- *   gpt-5.6-*           未知，但**远小于** 1_048_576  ❌ 明确超报
- *       上游 `chatgpt.com/backend-api/codex/models` 还没收录 5.6 系；同代
- *       gpt-5.5/5.4 报 context_window=272_000。流量日志(960 次 codex 请求)里
- *       成功过的最大 input_tokens = 371_756，再往上就是
- *       `context_length_exceeded`("Your input exceeds the context window")，
- *       4 天内没有任何一次 >371_756 的成功。真实上限落在 (371_756, ≪1_048_576]，
- *       要钉死需要再做一轮二分，每次要真烧几十万输入 token 的订阅额度。
- */
-const PUBLIC_MODEL_POLICY: readonly PublicModelPolicy[] = [
-  {
-    id: 'gemini-3.6-flash-high',
-    source: 'antigravity',
-    supportsImages: true,
-    supportsTools: true,
-    supportsThinking: true,
-    thinkingEfforts: ['high'],
-    defaultThinkingEffort: 'high',
-    canDisableThinking: false,
-    contextWindow: 1_048_576,
-    maxOutputTokens: antigravityMaxOutputTokens('gemini-3.6-flash-high'),
-  },
-  {
-    id: 'gemini-3.6-flash-medium',
-    source: 'antigravity',
-    supportsImages: true,
-    supportsTools: true,
-    supportsThinking: true,
-    thinkingEfforts: ['medium'],
-    defaultThinkingEffort: 'medium',
-    canDisableThinking: false,
-    contextWindow: 1_048_576,
-    maxOutputTokens: antigravityMaxOutputTokens('gemini-3.6-flash-medium'),
-  },
-  {
-    id: 'gemini-3.6-flash-low',
-    source: 'antigravity',
-    supportsImages: true,
-    supportsTools: true,
-    supportsThinking: true,
-    thinkingEfforts: ['low'],
-    defaultThinkingEffort: 'low',
-    canDisableThinking: false,
-    contextWindow: 1_048_576,
-    maxOutputTokens: antigravityMaxOutputTokens('gemini-3.6-flash-low'),
-  },
-  ...(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'] as const).map(
-    (id): PublicModelPolicy => ({
-      id,
-      source: 'codex',
-      supportsImages: true,
-      supportsTools: true,
-      supportsThinking: true,
-      thinkingEfforts: ['low', 'medium', 'high'],
-      defaultThinkingEffort: 'high',
-      canDisableThinking: true,
-      contextWindow: 1_048_576,
-      maxOutputTokens: 128_000,
-    }),
-  ),
-  ...(['claude-opus-5', 'claude-sonnet-5', 'claude-fable-5', 'claude-opus-4-8'] as const).map(
-    (id): PublicModelPolicy => ({
-      id,
-      source: 'claude',
-      supportsImages: true,
-      supportsTools: true,
-      supportsThinking: true,
-      thinkingEfforts: [...COMMON_REASONING_EFFORTS],
-      defaultThinkingEffort: 'high',
-      // claude-fable-5 不接受显式关思考：thinking:{type:'disabled'} 上游 400
-      // "\"thinking.type.disabled\" is not supported for this model."(实测 2026-08-03，
-      // 同批 opus-5 / sonnet-5 / opus-4-8 都接受)。下游 harness 按这个字段决定要不要
-      // 发 effort=none，报 true 就是在诱导它发一个必然 400 的请求。
-      canDisableThinking: id !== 'claude-fable-5',
-      contextWindow: 1_048_576,
-      maxOutputTokens: 128_000,
-    }),
-  ),
-] as const
-
 function idsOf(models: readonly ModelInfo[]): ReadonlySet<string> {
   return new Set(models.map(model => model.id))
 }
 
-/** Build the stable public catalog from provider availability snapshots. */
+/**
+ * Availability for one registry entry.
+ *
+ * The registry decides *what may be published*; this decides *what is reachable
+ * right now*.  Both must agree, so a relay outage or an expired subscription
+ * removes ids from the catalog instead of leaving them advertised and broken.
+ */
+function isReachable(
+  entry: RegistryEntry,
+  available: Readonly<Record<CatalogSource, ReadonlySet<string>>>,
+  relayIds: ReadonlySet<string>,
+): boolean {
+  switch (entry.channel) {
+    case 'local':
+      return available[entry.source!].has(entry.upstream)
+    case 'ccr':
+      return relayIds.has(entry.upstream)
+    case 'official':
+      return !!process.env.DEEPSEEK_API_KEY
+    case 'bailian':
+      return !!process.env.DASHSCOPE_API_KEY
+  }
+}
+
+/**
+ * Apply gateway policy to provider availability snapshots.
+ *
+ * Local and relay catalogs are merged rather than one shadowing the other:
+ * both channels publish four identically named Claude models, and the channel
+ * prefix is what keeps the merged ids unique and the routing unambiguous.
+ */
 export function buildAvailableModelCatalog(sources: CatalogSources): ModelInfo[] {
-  const availableBySource: Readonly<Record<CatalogSource, ReadonlySet<string>>> = {
+  const available: Readonly<Record<CatalogSource, ReadonlySet<string>>> = {
     antigravity: idsOf(sources.antigravity),
     codex: idsOf(sources.codex),
     claude: idsOf(sources.claude),
   }
-  const providerModels = PUBLIC_MODEL_POLICY.filter(policy =>
-    availableBySource[policy.source].has(policy.id),
-  ).map(({ source: _source, ...model }) => ({
-    ...model,
-    name: model.id,
-    thinkingEfforts: model.thinkingEfforts ? [...model.thinkingEfforts] : undefined,
-  }))
-  const deepSeekModels: ModelInfo[] = listDeepSeekModels().map(descriptor => ({
-    id: descriptor.id,
-    name: descriptor.id,
-    supportsImages: descriptor.supportsImages,
-    supportsTools: descriptor.supportsTools,
-    supportsThinking: descriptor.supportsThinking,
-    thinkingEfforts: [...descriptor.thinkingEfforts],
-    defaultThinkingEffort: descriptor.thinkingEfforts[0],
-    canDisableThinking: descriptor.canDisableThinking,
-    contextWindow: descriptor.contextWindow,
-    maxOutputTokens: descriptor.maxOutputTokens,
-  }))
-  return [...providerModels, ...deepSeekModels]
+  const relayIds = idsOf(sources.ccr ?? [])
+  return listRegistry()
+    .filter(entry => isReachable(entry, available, relayIds))
+    .map(toModelInfo)
 }
 
 async function isolateCatalog(
-  source: CatalogSource,
+  source: CatalogSource | 'ccr',
   load: () => Promise<readonly ModelInfo[]>,
 ): Promise<readonly ModelInfo[]> {
   try {
@@ -214,9 +115,6 @@ async function isolateCatalog(
 
 /** Query independent provider catalogs concurrently, then apply gateway policy. */
 export async function listAvailableModels(): Promise<ModelInfo[]> {
-  if (isCcRelayProtocolAware()) {
-    return [...await listCcRelayModels()]
-  }
   if (process.env.FORCE_OPENAI_COMPAT === '1') {
     const provider = createOpenaiCompatProvider({
       baseURL: process.env.OPENAI_BASE_URL ?? '',
@@ -236,7 +134,7 @@ export async function listAvailableModels(): Promise<ModelInfo[]> {
   const codexCredit = credits.find(credit => credit.provider === 'codex')
   const claudeCredit = credits.find(credit => credit.provider === 'claude')
 
-  const [antigravity, codex, claude] = await Promise.all([
+  const [antigravity, codex, claude, ccr] = await Promise.all([
     isolateCatalog('antigravity', async () => {
       const provider = createAntigravityProvider({ model: ANTIGRAVITY_DEFAULT_MODEL })
       await provider.prepare?.()
@@ -251,7 +149,10 @@ export async function listAvailableModels(): Promise<ModelInfo[]> {
     isolateCatalog('claude', async () => {
       if (!claudeCredit) return []
       const provider = createAnthropicPassthroughProvider({
-        baseURL: process.env.ANTHROPIC_BASE_URL ?? 'https://api.anthropic.com',
+        // Never inherit ANTHROPIC_BASE_URL here: when cc-relay egress is
+        // configured it points at the relay, which would make the *local*
+        // channel probe the relay and republish relay models as local ones.
+        baseURL: 'https://api.anthropic.com',
         apiKey: claudeCredit.type === 'api_key' ? (claudeCredit.value ?? '') : '',
         model: 'claude-opus-5',
         ...(claudeCredit.type === 'oauth' && claudeCredit.source
@@ -261,9 +162,10 @@ export async function listAvailableModels(): Promise<ModelInfo[]> {
       await provider.prepare?.()
       return (await provider.listModels?.()) ?? []
     }),
+    isolateCatalog('ccr', async () => (isCcRelayProtocolAware() ? listCcRelayModels() : [])),
   ])
 
-  return buildAvailableModelCatalog({ antigravity, codex, claude })
+  return buildAvailableModelCatalog({ antigravity, codex, claude, ccr })
 }
 
 function positive(value: number | undefined, field: string, modelId: string): number {

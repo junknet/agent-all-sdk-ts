@@ -4,20 +4,21 @@
 
 import { AnthropicEventEmitter } from './emitter.js'
 import { debugLog, extractRequestBody, shouldPassthrough } from './passthrough.js'
-import { devlog, redactHeaders, teeForLog, newTrace } from './devlog.js'
+import { devlog, devlogLosses, redactHeaders, teeForLog, newTrace } from './devlog.js'
 import { compressImages } from './image_compress.js'
 import type { WireProvider } from './types.js'
 import { createOpenaiCompatProvider } from './providers/openai_compat_provider.js'
 import { createCodexProvider } from './providers/codex_provider.js'
 import { createAntigravityProvider, ANTIGRAVITY_DEFAULT_MODEL } from './providers/antigravity_provider.js'
 import { createAnthropicPassthroughProvider } from './providers/anthropic_passthrough_provider.js'
-import { resolveDeepSeekRoute, hasDeepSeekPlatformPrefix } from './deepseek_routes.js'
+import { resolveDeepSeekRoute } from './deepseek_routes.js'
 import { detectLocalCredits, type CustomTokens } from './auth.js'
 import {
   ccRelayConfig,
   ccRelayProtocolForModel,
   isCcRelayProtocolAware,
 } from './cc_relay.js'
+import { findRegistryEntry, hasChannelPrefix, type RegistryEntry } from './model_registry.js'
 
 export interface PickProviderOpts {
   model?: string
@@ -49,6 +50,11 @@ export function resolveModel(
   model: string | undefined,
   userText: string,
 ): { model: string; escalated: boolean } {
+  // A channel-qualified id is an explicit choice of egress, so neither the
+  // haiku remap nor the 「思考」 escalation may rewrite it: silently moving
+  // ccr-claude-haiku-4-5 onto a local gemini gear would bill the wrong
+  // subscription and make the published id a lie.
+  if (hasChannelPrefix(model ?? '')) return { model: model ?? '', escalated: false }
   // Protocol-aware cc-relay publishes the exact public model ids.  Rewriting a
   // selected id would make its catalog-derived protocol lookup incorrect.
   if (isCcRelayProtocolAware()) return { model: model ?? '', escalated: false }
@@ -99,6 +105,132 @@ export async function pickCcRelayWireProvider(opts: PickProviderOpts): Promise<W
     model,
     authScheme: 'x-api-key',
   })
+}
+
+/** Build the egress for one relay-published upstream id. */
+async function ccRelayProviderFor(upstream: string, inboundBeta?: string): Promise<WireProvider> {
+  const { baseURL, apiKey } = ccRelayConfig()
+  const protocol = await ccRelayProtocolForModel(upstream)
+  if (protocol === 'anthropic_messages') {
+    return createAnthropicPassthroughProvider({ baseURL, apiKey, model: upstream, inboundBeta })
+  }
+  if (protocol === 'openai_chat_completions') {
+    return createOpenaiCompatProvider({
+      baseURL: `${baseURL}/v1`,
+      apiKey,
+      model: upstream,
+      authScheme: 'x-api-key',
+      ignoreEnvironmentModel: true,
+    })
+  }
+  return createCodexProvider({
+    responsesBaseURL: `${baseURL}/v1`,
+    apiKey,
+    model: upstream,
+    authScheme: 'x-api-key',
+  })
+}
+
+function localProviderFor(entry: RegistryEntry, opts: PickProviderOpts): WireProvider {
+  const credits = detectLocalCredits(opts)
+  if (entry.source === 'antigravity') {
+    const geminiCredit = credits.find(c => c.provider === 'gemini')
+    return createAntigravityProvider({
+      model: entry.upstream,
+      source: geminiCredit?.type === 'oauth' ? geminiCredit.source : undefined,
+    })
+  }
+  if (entry.source === 'codex') {
+    const codexCredit = credits.find(c => c.provider === 'codex')
+    if (codexCredit?.type !== 'oauth' || !codexCredit.source) {
+      throw new Error(`${entry.id} requires a ChatGPT OAuth credit (~/.codex/auth.json)`)
+    }
+    return createCodexProvider({ source: codexCredit.source, model: entry.upstream })
+  }
+  const claudeCredit = credits.find(c => c.provider === 'claude')
+  if (!claudeCredit) throw new Error(`${entry.id} requires an Anthropic credit`)
+  // Pinned, never ANTHROPIC_BASE_URL: with cc-relay egress configured that
+  // variable points at the relay, which would quietly turn every local-claude-*
+  // request into a relay request billed to the wrong account.
+  const baseURL = 'https://api.anthropic.com'
+  if (claudeCredit.type === 'oauth' && claudeCredit.source) {
+    return createAnthropicPassthroughProvider({
+      baseURL,
+      apiKey: '',
+      source: claudeCredit.source,
+      model: entry.upstream,
+      inboundBeta: opts.inboundBeta,
+    })
+  }
+  return createAnthropicPassthroughProvider({
+    baseURL,
+    apiKey: claudeCredit.value ?? '',
+    model: entry.upstream,
+    inboundBeta: opts.inboundBeta,
+  })
+}
+
+/**
+ * Channel-qualified routing.  The `<channel>/` prefix — not the model family —
+ * decides the egress, so the id a client selects is exactly the account and
+ * endpoint its request will spend.
+ *
+ * Returns null for a bare id so legacy clients keep their existing routing;
+ * an unknown *prefixed* id fails loudly instead of falling through, because
+ * silently reinterpreting it would defeat the point of naming the channel.
+ */
+export async function pickRegistryWireProvider(
+  opts: PickProviderOpts,
+): Promise<WireProvider | null> {
+  const model = opts.model ?? ''
+  const entry = findRegistryEntry(model)
+  if (!entry) {
+    if (hasChannelPrefix(model)) {
+      throw new Error(`Model is not published by this gateway: ${model}`)
+    }
+    return null
+  }
+
+  switch (entry.channel) {
+    case 'ccr':
+      if (!isCcRelayProtocolAware()) {
+        throw new Error(`${entry.id} requires CC_RELAY_PROTOCOL_AWARE`)
+      }
+      return ccRelayProviderFor(entry.upstream, opts.inboundBeta)
+    case 'official':
+      return createAnthropicPassthroughProvider({
+        baseURL: process.env.DEEPSEEK_ANTHROPIC_BASE_URL ?? 'https://api.deepseek.com/anthropic',
+        apiKey: process.env.DEEPSEEK_API_KEY ?? opts.apiKey ?? '',
+        model: entry.upstream,
+        inboundBeta: opts.inboundBeta,
+      })
+    case 'bailian':
+      return createOpenaiCompatProvider({
+        baseURL:
+          process.env.DASHSCOPE_BASE_URL ?? 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+        apiKey: process.env.DASHSCOPE_API_KEY ?? opts.apiKey ?? '',
+        model: entry.upstream,
+        supportsImages: entry.images,
+        ignoreEnvironmentModel: true,
+      })
+    case 'local':
+      return localProviderFor(entry, opts)
+  }
+}
+
+/**
+ * The one provider-selection entrypoint every ingress protocol shares.
+ *
+ * Order is a fallback chain, most specific first: an explicit channel-qualified
+ * id wins, then legacy bare ids keep their cc-relay behaviour, then local
+ * credential detection.
+ */
+export async function selectWireProvider(opts: PickProviderOpts): Promise<WireProvider | null> {
+  return (
+    (await pickRegistryWireProvider(opts)) ??
+    (await pickCcRelayWireProvider(opts)) ??
+    pickWireProvider(opts)
+  )
 }
 
 // Extract ONLY the latest human-authored user turn from an inbound request (any protocol),
@@ -189,32 +321,15 @@ export function pickWireProvider(opts: PickProviderOpts): WireProvider | null {
     })
   }
 
-  // 2.4 DeepSeek: a bare supported id defaults to the official Anthropic API.
-  //    Prefixes make the platform explicit:
-  //      official/deepseek-v4-flash       -> api.deepseek.com/anthropic
-  //      bailian/deepseek-v4-flash-0731   -> DashScope OpenAI-compatible API
-  //    The official API calls the current Flash weights "deepseek-v4-flash";
-  //    "DeepSeek-V4-Flash-0731" is the model-version label in the docs, not
-  //    an accepted official API model id.
+  // 2.4 DeepSeek, bare ids only. Channel-qualified ids never reach this branch —
+  //     pickRegistryWireProvider handled them and both platforms live there.
   const deepseekRoute = resolveDeepSeekRoute(opts.model ?? '')
-  if (deepseekRoute || hasDeepSeekPlatformPrefix(opts.model ?? '')) {
-    if (!deepseekRoute) {
-      throw new Error(`Invalid DeepSeek platform/model id: ${opts.model ?? ''}`)
-    }
-    if (deepseekRoute.platform === 'official') {
-      return createAnthropicPassthroughProvider({
-        baseURL: process.env.DEEPSEEK_ANTHROPIC_BASE_URL ?? 'https://api.deepseek.com/anthropic',
-        apiKey: process.env.DEEPSEEK_API_KEY ?? opts.apiKey ?? '',
-        model: deepseekRoute.model,
-        inboundBeta: opts.inboundBeta,
-      })
-    }
-    return createOpenaiCompatProvider({
-      baseURL: process.env.DASHSCOPE_BASE_URL ?? 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-      apiKey: process.env.DASHSCOPE_API_KEY ?? opts.apiKey ?? '',
-      model: process.env.DASHSCOPE_MODEL ?? deepseekRoute.model,
-      supportsImages: false,
-      ignoreEnvironmentModel: true,
+  if (deepseekRoute) {
+    return createAnthropicPassthroughProvider({
+      baseURL: process.env.DEEPSEEK_ANTHROPIC_BASE_URL ?? 'https://api.deepseek.com/anthropic',
+      apiKey: process.env.DEEPSEEK_API_KEY ?? opts.apiKey ?? '',
+      model: deepseekRoute.model,
+      inboundBeta: opts.inboundBeta,
     })
   }
 
@@ -314,6 +429,8 @@ export function createWireAdapter(
       devlog(trace, 'error', { provider: provider.name, at: 'buildRequest', message: String(err?.message ?? err) })
       return errorResponse(500, `wire ${provider.name} buildRequest failed: ${err?.message ?? err}`)
     }
+    // 出口翻译丢掉的东西逐条落盘。provider 没有 trace，所以由这里代记。
+    devlogLosses(trace, prepared.losses)
     devlog(trace, 'upstream_request', {
       provider: provider.name,
       url: prepared.url,
@@ -353,7 +470,7 @@ export function createWireAdapter(
     const messageId = `msg_wire_${Date.now().toString(36)}`
     const MAX_ATTEMPTS = 3
 
-    let finalEmitter = new AnthropicEventEmitter()
+    let finalEmitter = new AnthropicEventEmitter(trace)
     let attemptResp: Response | null = upstream
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       if (attempt > 1) {
@@ -375,7 +492,7 @@ export function createWireAdapter(
         }
       }
       const logged = teeForLog(trace, 'upstream_sse', attemptResp)
-      const em = new AnthropicEventEmitter()
+      const em = new AnthropicEventEmitter(trace)
       try {
         await provider.parseStream(logged, em)
       } catch (err: any) {
@@ -396,6 +513,7 @@ export function createWireAdapter(
       toolUseCount: finalEmitter.getToolUseCount(),
       usage,
       unusable: finalEmitter.isUnusable(),
+      unhandledEvents: finalEmitter.getUnhandledCount(),
     })
 
     const stream = new ReadableStream<Uint8Array>({

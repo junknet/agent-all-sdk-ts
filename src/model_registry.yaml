@@ -1,0 +1,306 @@
+# 网关公开目录的唯一真源。
+#
+# id 规范: <channel>-<model>  —— 前缀标识**出口通道**，不是模型家族。
+#
+# 分隔符是 '-' 而不是 '/': OMP 17.2.7 的 proxy discovery 会静默丢弃 id 里带 '/'
+# 的条目(实测: 同一目录里 chan-dash-test 被采纳、chan/prefixed-test 从不出现在
+# 任何日志里)。它把 '/' 保留给 provider/model 这一层，多一个就解析不出来。
+# 同一个模型经不同通道拿到的配额、计费和可用性都不同，所以通道必须进 id：
+# local-claude-opus-5 走本机 OAuth 订阅，ccr-claude-opus-5 走 cc-relay 转售，
+# 两者同名不同物。裸 id 一律拒绝，调用方必须显式选通道。
+#
+# 为什么能力要写在这里而不是从上游发现：
+#   - cc-relay 的 GET /v1/models 只回 {id, display_name, client_protocol}，
+#     没有任何 context/thinking 元数据。下游 harness (omp) 拿 context_length
+#     算压缩阈值、拿 thinkingEfforts 决定发什么 effort，缺了就只能瞎猜。
+#   - antigravity/codex/claude 的上游目录只证明「可用」，不描述档位语义。
+# 所以: 上游目录决定 available，本文件决定 published 与 capabilities。
+#
+# verified 说的是**窗口/输出上限这两个数字**是否有权威来源，不是开关，也不是
+# 可用性 —— 全部 29 个 id 都已实测出过文本，131 组 (模型 × 声明档位) 也已逐组
+# 发真请求验证全部被上游接受 (probe 见 scripts/ 旁的说明)。
+#   true  — contextWindow/maxOutputTokens 来自权威来源:
+#           claude 系取 GET api.anthropic.com/v1/models 的 max_input_tokens
+#           与 max_tokens (2026-08-04)；relay 转发的是同一批上游权重。
+#   false — 这两个数字仍是同族推定或已证实下界，见各自注释。路由不受影响，
+#           只影响下游按 70% 算压缩阈值的时机。
+
+version: 1
+
+channels:
+  local:
+    description: 本机凭证直连 (antigravity OAuth / codex OAuth / anthropic OAuth)
+    note: 不经任何第三方转售，配额来自本机登录的订阅。
+  ccr:
+    description: cc-relay.tikteken.com 转售出口
+    requires_env: CC_RELAY_PROTOCOL_AWARE
+    note: 协议由 relay 的 client_protocol 字段决定，能力由本文件补齐。
+  official:
+    description: DeepSeek 官方 api.deepseek.com
+    requires_env: DEEPSEEK_API_KEY
+  bailian:
+    description: 阿里百炼 DashScope OpenAI 兼容端点
+    requires_env: DASHSCOPE_API_KEY
+
+# ── 能力模板 ────────────────────────────────────────────────────────────
+_templates:
+  # Gemini 的 high/medium/low 是**独立 model id**，不是同一模型的档位参数:
+  # antigravity 把思考预算 (10000/4000/1000 tokens) 编进了 id。所以每个 id
+  # 只声明自己那一档，且不可关闭思考。
+  gemini: &gemini
+    channel: local
+    source: antigravity
+    images: true
+    tools: true
+    contextWindow: 1048576
+    maxOutputTokens: 65536
+    verified: true
+
+  # contextWindow 是**已证实的安全下界**，不是真实上限 —— 真实上限取不到:
+  #   - chatgpt.com/backend-api/codex/models 要 client_version 参数, 400;
+  #   - backend-api/models 能查, 但那是 web 端目录 (gpt-5.6-{sol,terra,luna}-wm
+  #     都报 262_144), 与 codex 出口不是同一套配额: 本网关流量日志里 codex
+  #     出口成功过 input_tokens=371_756, 已经超过 262_144。
+  # 于是取 371_756 —— 实测成功过的最大输入, 再往上就 context_length_exceeded。
+  # 比原来声明的 1_048_576 安全: 下游按 70% 触发压缩, 报大了就压得太晚, 直接
+  # 撞上游硬限; 报成下界只是稍早压缩, 不会失败。要钉死真值需再做一轮二分,
+  # 每次真烧几十万输入 token 的订阅额度。
+  codex: &codex
+    channel: local
+    source: codex
+    images: true
+    tools: true
+    contextWindow: 371756
+    maxOutputTokens: 128000
+    thinking:
+      efforts: [low, medium, high]
+      default: high
+      canDisable: true
+    verified: false
+
+  # 声明 1_048_576 但 GET api.anthropic.com/v1/models 的 max_input_tokens
+  # 是 1_000_000 (opus-5/sonnet-5/fable-5/opus-4-8 全是), 超报 4.9%。
+  claude: &claude
+    channel: local
+    source: claude
+    images: true
+    tools: true
+    contextWindow: 1000000
+    maxOutputTokens: 128000
+    thinking:
+      efforts: [minimal, low, medium, high, xhigh, max]
+      default: high
+      canDisable: true
+    verified: true
+
+  # 两个平台的 GET /models 都只回 {id}，不含任何限额字段(2026-08-04 实测
+  # api.deepseek.com/models 与 dashscope 的 compatible-mode/v1/models)，
+  # 所以下面两个数字沿用历史配置，没有权威来源 —— verified: false。
+  # 已取证的是 id 本身: official 侧只有 deepseek-v4-flash / deepseek-v4-pro,
+  # 带日期的 deepseek-v4-flash-0731 只存在于 bailian, 与 upstream 映射一致。
+  deepseek: &deepseek
+    images: false
+    tools: true
+    contextWindow: 1048576
+    maxOutputTokens: 384000
+    thinking:
+      efforts: [high, max]
+      default: high
+      canDisable: true
+    verified: false
+
+  # cc-relay 未提供任何能力元数据。claude 系的窗口/输出上限改从权威来源取:
+  # GET api.anthropic.com/v1/models 的 max_input_tokens / max_tokens
+  # (2026-08-04 实测)，relay 转发的就是这批上游权重。每条 ccr-claude-* 都
+  # 显式覆盖了这两个值 —— 它们并不同档: opus-4-5 与 haiku-4-5 只有 200k，
+  # sonnet-4-5 是 1M 窗口但只有 64k 输出。这里的模板值只是兜底。
+  ccr_claude: &ccr_claude
+    channel: ccr
+    images: true
+    tools: true
+    contextWindow: 200000
+    maxOutputTokens: 64000
+    thinking:
+      efforts: [minimal, low, medium, high, xhigh, max]
+      default: high
+      canDisable: true
+    verified: false
+
+  ccr_gpt: &ccr_gpt
+    channel: ccr
+    images: true
+    tools: true
+    contextWindow: 272000
+    maxOutputTokens: 128000
+    thinking:
+      efforts: [low, medium, high]
+      default: high
+      canDisable: true
+    verified: false
+
+  ccr_chat: &ccr_chat
+    channel: ccr
+    images: false
+    tools: true
+    contextWindow: 131072
+    maxOutputTokens: 32768
+    verified: false
+
+# ── 合法 model id 全表 ──────────────────────────────────────────────────
+models:
+  # ── local: Gemini (antigravity OAuth) ─────────────────────────────────
+  - id: local-gemini-3.6-flash-high
+    <<: *gemini
+    upstream: gemini-3.6-flash-high
+    thinking: { efforts: [high], default: high, canDisable: false }
+  - id: local-gemini-3.6-flash-medium
+    <<: *gemini
+    upstream: gemini-3.6-flash-medium
+    thinking: { efforts: [medium], default: medium, canDisable: false }
+  - id: local-gemini-3.6-flash-low
+    <<: *gemini
+    upstream: gemini-3.6-flash-low
+    thinking: { efforts: [low], default: low, canDisable: false }
+
+  # ── local: Codex (ChatGPT 订阅 OAuth) ─────────────────────────────────
+  - id: local-gpt-5.6-sol
+    <<: *codex
+    upstream: gpt-5.6-sol
+  - id: local-gpt-5.6-terra
+    <<: *codex
+    upstream: gpt-5.6-terra
+  - id: local-gpt-5.6-luna
+    <<: *codex
+    upstream: gpt-5.6-luna
+
+  # ── local: Claude (Anthropic OAuth) ───────────────────────────────────
+  - id: local-claude-opus-5
+    <<: *claude
+    upstream: claude-opus-5
+  - id: local-claude-sonnet-5
+    <<: *claude
+    upstream: claude-sonnet-5
+  - id: local-claude-fable-5
+    <<: *claude
+    upstream: claude-fable-5
+    # 实测 2026-08-03: thinking:{type:'disabled'} 上游 400
+    # "thinking.type.disabled is not supported for this model"。
+    # 报 true 就是在诱导下游发一个必然 400 的请求。同批 opus-5/sonnet-5/
+    # opus-4-8 都接受 disabled。
+    thinking:
+      efforts: [minimal, low, medium, high, xhigh, max]
+      default: high
+      canDisable: false
+  - id: local-claude-opus-4-8
+    <<: *claude
+    upstream: claude-opus-4-8
+
+  # ── official: DeepSeek 官方 ───────────────────────────────────────────
+  # 官方 API 把当前 Flash 权重就叫 deepseek-v4-flash;
+  # "DeepSeek-V4-Flash-0731" 是文档里的版本标签, 不是官方接受的 model id。
+  - id: official-deepseek-v4-flash
+    <<: *deepseek
+    channel: official
+    upstream: deepseek-v4-flash
+  - id: official-deepseek-v4-pro
+    <<: *deepseek
+    channel: official
+    upstream: deepseek-v4-pro
+
+  # ── bailian: 阿里百炼 DashScope ───────────────────────────────────────
+  - id: bailian-deepseek-v4-flash-0731
+    <<: *deepseek
+    channel: bailian
+    upstream: deepseek-v4-flash-0731
+    # DashScope 侧不接受关思考。
+    thinking: { efforts: [high, max], default: high, canDisable: false }
+
+  # ── ccr: cc-relay 转售 ────────────────────────────────────────────────
+  # cc-relay 的 GET /v1/models 还列着 claude-opus-4-8 / claude-opus-4 /
+  # claude-sonnet-4, 但 2026-08-04 实测这三个每次都回 upstream 503(重试无效,
+  # 其余 16 个同批全部正常), 即 relay 挂着牌子不供货。发布一个必然 503 的 id
+  # 只会让下游把它选进来再失败, 所以这里不发布。relay 恢复后加回即可 ——
+  # 判据是 `curl -s localhost:8085/v1/messages -d '{"model":"ccr-claude-opus-4",...}'`
+  # 能出文本, 不是它重新出现在 relay 目录里。
+  - id: ccr-claude-opus-5
+    <<: *ccr_claude
+    upstream: claude-opus-5
+    contextWindow: 1000000
+    maxOutputTokens: 128000
+    verified: true
+  - id: ccr-claude-opus-4-7
+    <<: *ccr_claude
+    upstream: claude-opus-4-7
+    contextWindow: 1000000
+    maxOutputTokens: 128000
+    verified: true
+  - id: ccr-claude-opus-4-6
+    <<: *ccr_claude
+    upstream: claude-opus-4-6
+    contextWindow: 1000000
+    maxOutputTokens: 128000
+    verified: true
+  - id: ccr-claude-opus-4-5
+    <<: *ccr_claude
+    upstream: claude-opus-4-5
+    contextWindow: 200000
+    maxOutputTokens: 64000
+    verified: true
+  - id: ccr-claude-sonnet-5
+    <<: *ccr_claude
+    upstream: claude-sonnet-5
+    contextWindow: 1000000
+    maxOutputTokens: 128000
+    verified: true
+  - id: ccr-claude-sonnet-4-6
+    <<: *ccr_claude
+    upstream: claude-sonnet-4-6
+    contextWindow: 1000000
+    maxOutputTokens: 128000
+    verified: true
+  - id: ccr-claude-sonnet-4-5
+    <<: *ccr_claude
+    upstream: claude-sonnet-4-5
+    contextWindow: 1000000
+    maxOutputTokens: 64000
+    verified: true
+  - id: ccr-claude-fable-5
+    <<: *ccr_claude
+    upstream: claude-fable-5
+    thinking:
+      efforts: [minimal, low, medium, high, xhigh, max]
+      default: high
+      canDisable: false
+    contextWindow: 1000000
+    maxOutputTokens: 128000
+    verified: true
+  - id: ccr-claude-haiku-4-5
+    <<: *ccr_claude
+    upstream: claude-haiku-4-5
+    contextWindow: 200000
+    maxOutputTokens: 64000
+    verified: true
+  - id: ccr-gpt-5-6-sol
+    <<: *ccr_gpt
+    upstream: gpt-5-6-sol
+  - id: ccr-gpt-5-6-terra
+    <<: *ccr_gpt
+    upstream: gpt-5-6-terra
+  - id: ccr-gpt-5-4
+    <<: *ccr_gpt
+    upstream: gpt-5-4
+  - id: ccr-gpt-5-3-codex
+    <<: *ccr_gpt
+    upstream: gpt-5-3-codex
+  - id: ccr-deepseek-v4
+    <<: *ccr_chat
+    upstream: deepseek-v4
+    contextWindow: 1048576
+    maxOutputTokens: 65536
+    thinking: { efforts: [high, max], default: high, canDisable: true }
+  - id: ccr-glm-5-2
+    <<: *ccr_chat
+    upstream: glm-5-2
+  - id: ccr-kimi-k3
+    <<: *ccr_chat
+    upstream: kimi-k3

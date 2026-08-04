@@ -201,6 +201,19 @@ export function createAnthropicPassthroughProvider(
           reader.releaseLock()
         } catch {}
       }
+      // 本 provider 是纯字节转发，没有事件 switch，因此没有"没匹配上就丢掉"的黑洞 ——
+      // 每个上游事件都原样出站，unhandled 在这里无对象可记(详见 emitter.unhandled 的说明)。
+      // 它唯一的静默失败是另一半：上游把连接掐了却没发 message_stop / error，
+      // createWireAdapter 的兜底 finish() 会补一份 stop_reason:'end_turn' 的收尾，
+      // 于是半截流看起来像一次正常结束。
+      if (!emitter.hasUpstreamTerminal()) {
+        emitter.error({
+          type: 'api_error',
+          message:
+            '[gateway] anthropic-passthrough upstream stream ended without message_stop; ' +
+            'the turn is truncated',
+        })
+      }
     },
 
     async listModels(): Promise<ModelInfo[]> {

@@ -7,6 +7,7 @@ import type {
   AnthropicMessage,
   AnthropicMessagesRequest,
   AnthropicTool,
+  IRLoss,
   WireProvider,
   WirePreparedRequest,
   ModelInfo,
@@ -111,7 +112,21 @@ export function createCodexProvider(opts: CodexOpts): WireProvider {
       if (req.tools && req.tools.length > 0) body.tools = translateTools(req.tools)
       // IR 的 max_tokens 在此丢弃: Codex Responses 端点现已拒收 max_output_tokens
       // (400 "Unsupported parameter: max_output_tokens")，且无等价替代参数。
-      // 客户端传的上限对 codex 出口无效——由上游自行截断。
+      // 客户端传的上限对 codex 出口无效——由上游自行截断。丢弃本身没得选，但不能悄悄丢：
+      // 客户端设了上限、以为生效了，实际零作用，此前没有任何地方告知。
+      const losses: IRLoss[] = []
+      if (typeof req.max_tokens === 'number') {
+        losses.push({
+          stage: 'egress',
+          provider: 'codex',
+          path: '$.max_tokens',
+          kind: 'dropped',
+          detail:
+            `client asked for max_tokens=${req.max_tokens}; the Codex Responses endpoint rejects ` +
+            'max_output_tokens (400 "Unsupported parameter") and has no equivalent, so the output ' +
+            'length limit is not enforced on this route — upstream truncates on its own',
+        })
+      }
       const effort = toCodexEffort(req.reasoning)
       if (effort) body.reasoning = { effort }
       if (req.serviceTier?.tier === 'priority') body.service_tier = 'priority'
@@ -141,6 +156,7 @@ export function createCodexProvider(opts: CodexOpts): WireProvider {
               'OpenAI-Beta': 'responses=experimental',
             },
         body: JSON.stringify(body),
+        losses,
       }
     },
 
@@ -149,6 +165,9 @@ export function createCodexProvider(opts: CodexOpts): WireProvider {
       let hadTools = false
       let fallbackToolCounter = 0
       let upstreamErrorSurfaced = false
+      // Responses 流必须以 response.completed / response.failed / error 之一收尾。
+      // 一个都没等到就意味着流被掐断，绝不能当成正常结束(见循环后的兜底)。
+      let sawTerminal = false
       const toolCalls = new Map<string, { order: number; id: string; name: string; arguments: string }>()
       const toolKeyByOutputIndex = new Map<number, string>()
 
@@ -198,7 +217,12 @@ export function createCodexProvider(opts: CodexOpts): WireProvider {
 
       for await (const evt of iterSSE(response)) {
         const data = tryParseJSON<any>(evt.data)
-        if (!data) continue
+        if (!data) {
+          // data 段解析不出 JSON：上游要么换了编码，要么流被截断在半个事件上。
+          // 静默丢掉的话它就永远不存在了。
+          emitter.unhandled(evt.event ?? '<unparseable>', evt.data)
+          continue
+        }
         const t = data.type as string
 
         switch (t) {
@@ -221,6 +245,7 @@ export function createCodexProvider(opts: CodexOpts): WireProvider {
           // on retry), so we do NOT mark the turn unusable; that would only add pointless
           // retry latency with the exact same result.
           case 'error': {
+            sawTerminal = true
             if (upstreamErrorSurfaced) break // response.failed already surfaced the same rejection
             upstreamErrorSurfaced = true
             const err = data.error ?? {}
@@ -233,6 +258,7 @@ export function createCodexProvider(opts: CodexOpts): WireProvider {
             break
           }
           case 'response.failed': {
+            sawTerminal = true
             if (upstreamErrorSurfaced) break // top-level `error` event already surfaced this
             upstreamErrorSurfaced = true
             const err = data.response?.error ?? {}
@@ -325,6 +351,7 @@ export function createCodexProvider(opts: CodexOpts): WireProvider {
             break
           }
           case 'response.completed': {
+            sawTerminal = true
             const usage = data.response?.usage
             if (usage) {
               // Responses API 的 input_tokens **含** input_tokens_details.cached_tokens
@@ -342,11 +369,37 @@ export function createCodexProvider(opts: CodexOpts): WireProvider {
             }
             break
           }
+          // 生命周期/心跳事件：确实不携带任何 IR 信息，丢掉是对的，但必须**显式**声明
+          // 丢，否则和"上游加了个新事件、我们没接住"混在同一个缺省分支里分不出来。
+          // 这批全部来自真实流量统计(2026-08-01..04 网关日志)，不是照文档猜的：
+          // response.created 432 / response.in_progress 365 / content_part.added 521 /
+          // content_part.done 521 / output_text.done 521(正文已由 .delta 累计) /
+          // keepalive 12(codex 自己的心跳，文档没写)。
+          case 'response.created':
+          case 'response.in_progress':
+          case 'response.content_part.added':
+          case 'response.content_part.done':
+          case 'response.output_text.done':
+          case 'keepalive':
+            break
+          default:
+            emitter.unhandled(t || '<no-type>', data)
         }
       }
 
       if (hadTools) emitBufferedToolCalls()
       emitter.setStopReason(hadTools ? 'tool_use' : 'end_turn')
+      // 流走完却一个终止事件都没见过 = 上游把连接掐了。此前这里直接 finish()，产出的是
+      // stop_reason:'end_turn' 的空回合 —— 一个"看起来成功"的 200，与真正的空回答无法
+      // 区分。显式报错是这次改造对客户端可见行为的唯一变化。
+      if (!sawTerminal) {
+        emitter.error({
+          type: 'api_error',
+          message:
+            '[gateway] codex upstream stream ended without a terminal event ' +
+            '(expected response.completed / response.failed / error); the turn is truncated',
+        })
+      }
       emitter.finish()
     },
 

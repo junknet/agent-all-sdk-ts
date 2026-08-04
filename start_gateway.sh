@@ -45,9 +45,12 @@ port_live() { timeout 2 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/${PORT}" 2
 # 原来 --restart 用的是 pkill -f "bun run src/server.ts"，而端口是环境变量传的、
 # 不出现在命令行里,于是同一份源码起的**所有**实例都会被打死 —— 实测
 # `AGENT_GATEWAY_PORT=8086 ./start_gateway.sh --restart` 把生产的 :8085 一起端了。
+# `|| true`: 端口空闲时 grep 返回 1, 在 set -euo pipefail 下会让调用方的
+# `restart_pid="$(port_pid)"` 整条脚本静默退出 —— 实测 `--restart` 打在一个还没
+# 有实例的端口上时, 脚本什么都不输出就结束, 看起来像启动失败。
 port_pid() {
-  ss -ltnpH "sport = :${PORT}" 2>/dev/null \
-    | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2
+  { ss -ltnpH "sport = :${PORT}" 2>/dev/null \
+    | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2; } || true
 }
 
 if [[ "${1:-}" == "--restart" ]]; then
@@ -86,6 +89,17 @@ fi
 KEY_UNSET=()
 if [[ -z "${OPENAI_API_KEY_EXPLICIT:-}" && ! "${FORCE_OPENAI_COMPAT:-}" =~ ^(1|true|yes)$ ]]; then
   KEY_UNSET=(-u OPENAI_API_KEY)
+fi
+
+# 同款保护, 给 Anthropic 一侧。auth.ts detectLocalCredits 的 claude 分支也是
+# else-if 链: 继承来的 ANTHROPIC_API_KEY 一命中, ~/.claude/.credentials.json 的
+# OAuth 就永远读不到。实测踩过: 交互 shell 里 source 过 ~/.config/agent_tools.env
+# (它把 ANTHROPIC_API_KEY 覆写成 DASHSCOPE 的 key) 之后起网关, claude 目录探活
+# 401 静默降级, /v1/models 里 4 个 local/claude-* 只剩 1 个。
+# 出口地址同理: 继承的 ANTHROPIC_BASE_URL 会把 local/claude-* 指到别人家。
+# 真要用 API key 直连: ANTHROPIC_API_KEY_EXPLICIT=1 ANTHROPIC_API_KEY=xxx ./start_gateway.sh
+if [[ -z "${ANTHROPIC_API_KEY_EXPLICIT:-}" ]]; then
+  KEY_UNSET+=(-u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL)
 fi
 
 # 显式下发端口: 脚本管的是 $PORT 这一个实例，子进程必须绑同一个端口，不能靠调用方

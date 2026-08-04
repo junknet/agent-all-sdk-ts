@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { resolveDeepSeekRoute } from '../src/deepseek_routes.js'
+import { findRegistryEntry } from '../src/model_registry.js'
 import { resolveModel } from '../src/index.js'
 import { parseCcRelayModels } from '../src/cc_relay.js'
 import {
@@ -44,29 +45,63 @@ describe('/v1/models discovery contract', () => {
   test('publishes only gateway-approved, currently available provider models', () => {
     const models = buildAvailableModelCatalog(sources)
     expect(models.map(model => model.id)).toEqual([
-      'gemini-3.6-flash-high',
-      'gpt-5.6-sol',
-      'claude-opus-5',
+      'local-gemini-3.6-flash-high',
+      'local-gpt-5.6-sol',
+      'local-claude-opus-5',
     ])
     expect(models.every(model => model.name === model.id)).toBe(true)
+  })
+
+  test('merges the relay catalog alongside local models under distinct ids', () => {
+    const models = buildAvailableModelCatalog({
+      ...sources,
+      ccr: [
+        { id: 'claude-opus-5', name: 'Opus 5' },
+        { id: 'kimi-k3', name: 'KIMI k3' },
+      ],
+    })
+    const ids = models.map(model => model.id)
+
+    // Both channels publish an "Opus 5"; only the prefix keeps them apart.
+    expect(ids).toContain('local-claude-opus-5')
+    expect(ids).toContain('ccr-claude-opus-5')
+    expect(ids).toContain('ccr-kimi-k3')
+    expect(new Set(ids).size).toBe(ids.length)
+    // A relay id the registry does not publish stays out of the catalog.
+    expect(ids).not.toContain('ccr-claude-opus-4-6')
+  })
+
+  test('omits relay models entirely when the relay catalog is unavailable', () => {
+    const ids = buildAvailableModelCatalog(sources).map(model => model.id)
+    expect(ids.some(id => id.startsWith('ccr-'))).toBe(false)
   })
 
   test('publishes credential-backed DeepSeek descriptors from the routing source of truth', () => {
     process.env.DASHSCOPE_API_KEY = 'test-only'
     const models = buildAvailableModelCatalog({ antigravity: [], codex: [], claude: [] })
-    expect(models.map(model => model.id)).toEqual(['bailian/deepseek-v4-flash-0731'])
-    expect(resolveDeepSeekRoute(models[0]!.id)).toEqual({
-      platform: 'bailian',
-      model: 'deepseek-v4-flash-0731',
+    // Only the Bailian entry: official/* needs DEEPSEEK_API_KEY, cleared above.
+    expect(models.map(model => model.id)).toEqual(['bailian-deepseek-v4-flash-0731'])
+    expect(findRegistryEntry(models[0]!.id)).toMatchObject({
+      channel: 'bailian',
+      upstream: 'deepseek-v4-flash-0731',
     })
+    // The legacy router now only answers to bare ids, and a bare id cannot
+    // express a platform, so it always means the official API.
+    expect(resolveDeepSeekRoute('deepseek-v4-pro')).toEqual({
+      platform: 'official',
+      model: 'deepseek-v4-pro',
+    })
+    // The dated weights exist only on Bailian, so the bare form must not
+    // silently resolve to a same-looking official model.
+    expect(() => resolveDeepSeekRoute('deepseek-v4-flash-0731')).toThrow(/bailian-/)
   })
 
   test('serializes an OMP-compatible list plus explicit gateway capabilities', () => {
     const response = createModelsListResponse(buildAvailableModelCatalog(sources))
     expect(response.object).toBe('list')
     expect(response.data[0]).toMatchObject({
-      id: 'gemini-3.6-flash-high',
-      name: 'gemini-3.6-flash-high',
+      id: 'local-gemini-3.6-flash-high',
+      name: 'local-gemini-3.6-flash-high',
       object: 'model',
       owned_by: 'local-gw',
       supported_endpoint_types: ['anthropic', 'openai'],
@@ -130,8 +165,8 @@ describe('/v1/models discovery contract', () => {
   test('DeepSeek catalog ids are never rewritten to Gemini by the text escalation trigger', () => {
     for (const model of [
       'deepseek-v4-flash',
-      'official/deepseek-v4-flash',
-      'bailian/deepseek-v4-flash-0731',
+      'official-deepseek-v4-flash',
+      'bailian-deepseek-v4-flash-0731',
     ]) {
       expect(resolveModel(model, 'think hard')).toEqual({ model, escalated: false })
     }

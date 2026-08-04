@@ -4,6 +4,7 @@
 
 import { formatSSE, tryParseJSON } from './sse.js'
 import { pickAnthropicUsage } from './usage.js'
+import { devlog } from './devlog.js'
 
 type BlockType = 'text' | 'thinking' | 'tool_use'
 
@@ -37,6 +38,45 @@ export class AnthropicEventEmitter {
   // (e.g. MALFORMED_FUNCTION_CALL with no content) so the adapter can retry.
   private producedContent = false
   private unusable = false
+  // 未被任何 case 认领的上游事件计数，以及裸转发流里是否见过上游自己的终止帧。
+  private unhandledCount = 0
+  private upstreamTerminalSeen = false
+  private readonly trace: string
+
+  // trace 只用来把 unhandled 归到某一次请求上；provider 单测里不给也能跑，
+  // 那时日志归到 'untraced'，计数照常。
+  constructor(trace?: string) {
+    this.trace = trace && trace.length > 0 ? trace : 'untraced'
+  }
+
+  /**
+   * 收到一个本 provider 不认识的上游事件。
+   *
+   * 只累计、只落盘，**绝不碰出站字节流** —— 出站形状必须与改造前逐字节一致。
+   *
+   * 之所以要有这个方法：parseStream 是纯命令式副作用契约，每个 provider 那个 switch
+   * 的缺省分支就是黑洞 —— 没匹配上的事件被直接 continue 掉，循环照样走到 finish()，
+   * 客户端拿到一个「200 但空」的假成功。实测一天 126 次 context_length_exceeded 全是
+   * 这么消失的，调用方分不清"没话说"和"上游拒了"，只能盲重试到自己的 retry cap。
+   * 上游哪天加个新事件类型，不该再靠故障反推才发现。
+   */
+  unhandled(rawType: string, raw: unknown): void {
+    this.unhandledCount += 1
+    devlog(this.trace, 'upstream_event_unhandled', {
+      rawType,
+      raw,
+      unhandledCount: this.unhandledCount,
+    })
+  }
+
+  getUnhandledCount(): number {
+    return this.unhandledCount
+  }
+
+  /** 裸转发(emitRawChunk)专用：上游是否发过自己的终止帧(message_stop / error)。 */
+  hasUpstreamTerminal(): boolean {
+    return this.upstreamTerminalSeen
+  }
 
   hasProducedContent(): boolean {
     return this.producedContent
@@ -274,7 +314,14 @@ export class AnthropicEventEmitter {
         // stop_reason:"max_tokens"，网关补的尾巴又改回 end_turn；tool_use 同理。
         // 经 /v1/chat/completions 出去时表现为两个 data:[DONE] 和一个多余的
         // finish_reason:"stop"。只有裸转发(emitRawChunk)的 provider 会走到这里。
-        if (obj.type === 'message_stop') this.finished = true
+        if (obj.type === 'message_stop') {
+          this.finished = true
+          this.upstreamTerminalSeen = true
+        } else if (obj.type === 'error') {
+          // 上游用 error 事件收尾同样是合法终止(PROTOCOL_REFERENCE §5.2)。它已经原样
+          // 转发给客户端了，不能再被当成"流被掐断"二次报错。
+          this.upstreamTerminalSeen = true
+        }
       }
     } catch {}
   }

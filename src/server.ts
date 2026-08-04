@@ -2,12 +2,13 @@
  * Agent Gateway HTTP server implemented using Bun.serve
  */
 
-import { pickCcRelayWireProvider, pickWireProvider, createWireAdapter, resolveModel, latestUserInput } from './index.js'
+import { selectWireProvider, createWireAdapter, resolveModel, latestUserInput } from './index.js'
+import { upstreamModelId } from './model_registry.js'
 import { pickIngressAdapter } from './ingress.js'
 import { decodeResponsesToAnthropic, encodeAnthropicToResponsesSSE } from './responses_api.js'
 import { createModelsListResponse, listAvailableModels } from './model_catalog.js'
 import { slimAnthropicRequest } from './slim.js'
-import { devlog, newTrace, setTraceMeta } from './devlog.js'
+import { devlog, devlogLosses, newTrace, setTraceMeta } from './devlog.js'
 
 // Identify the connecting harness + conversation session from inbound headers/body, so
 // logs split cleanly along two axes: WHICH harness (codex-g / claude-g / jcode) and
@@ -119,16 +120,15 @@ Bun.serve({
           body,
         })
 
-        const provider = await pickCcRelayWireProvider({
+        const provider = await selectWireProvider({
           model: anthropicReq.model,
           customTokens,
           // 透传客户端声明的 beta，见 anthropic_passthrough_provider.mergeBeta
           inboundBeta: req.headers.get('anthropic-beta') ?? undefined,
-        }) ?? pickWireProvider({
-          model: anthropicReq.model,
-          customTokens,
-          inboundBeta: req.headers.get('anthropic-beta') ?? undefined,
         })
+        // 通道前缀只用于选出口, 上游只认自己的裸 id。必须在选完 provider 之后剥,
+        // 之前剥就分不出 local-claude-opus-5 和 ccr-claude-opus-5 了。
+        anthropicReq.model = upstreamModelId(anthropicReq.model)
         if (!provider) {
           devlog(trace, 'error', { at: 'pickProvider', model: anthropicReq.model })
           return new Response(JSON.stringify({ error: `No provider found for model: ${anthropicReq.model}` }), {
@@ -170,26 +170,27 @@ Bun.serve({
         })
 
         const adapter = pickIngressAdapter('responses')
-        const { request: anthropicReq, namespaceTools, droppedNamespaces } =
+        const { request: anthropicReq, namespaceTools, droppedNamespaces, losses } =
           decodeResponsesToAnthropic(responsesReq)
-        
+
         if (droppedNamespaces.length > 0) {
           devlog(trace, 'tools_capped', { kept: namespaceTools.size, dropped: droppedNamespaces })
         }
+        // 入站解码的有损翻译逐条落盘（工具预算、builtin 工具、无法重放的 reasoning 历史…）。
+        devlogLosses(trace, losses)
 
         anthropicReq.model = resolveModel(anthropicReq.model, latestUserInput(responsesReq)).model
         const slimR = slimAnthropicRequest(anthropicReq)
         if (slimR.on) console.log(`[slim] responses: tools ${slimR.toolsBefore}→${slimR.toolsAfter}, system ${slimR.sysBefore}→${slimR.sysAfter} chars`)
-        const provider = await pickCcRelayWireProvider({
+        const provider = await selectWireProvider({
           model: anthropicReq.model,
           customTokens,
           // 透传客户端声明的 beta，见 anthropic_passthrough_provider.mergeBeta
           inboundBeta: req.headers.get('anthropic-beta') ?? undefined,
-        }) ?? pickWireProvider({
-          model: anthropicReq.model,
-          customTokens,
-          inboundBeta: req.headers.get('anthropic-beta') ?? undefined,
         })
+        // 通道前缀只用于选出口, 上游只认自己的裸 id。必须在选完 provider 之后剥,
+        // 之前剥就分不出 local-claude-opus-5 和 ccr-claude-opus-5 了。
+        anthropicReq.model = upstreamModelId(anthropicReq.model)
         if (!provider) {
           devlog(trace, 'error', { at: 'pickProvider', model: anthropicReq.model })
           return new Response(
@@ -239,16 +240,15 @@ Bun.serve({
         const slimC = slimAnthropicRequest(anthropicReq)
         if (slimC.on) console.log(`[slim] chat: tools ${slimC.toolsBefore}→${slimC.toolsAfter}, system ${slimC.sysBefore}→${slimC.sysAfter} chars`)
 
-        const provider = await pickCcRelayWireProvider({
+        const provider = await selectWireProvider({
           model: anthropicReq.model,
           customTokens,
           // 透传客户端声明的 beta，见 anthropic_passthrough_provider.mergeBeta
           inboundBeta: req.headers.get('anthropic-beta') ?? undefined,
-        }) ?? pickWireProvider({
-          model: anthropicReq.model,
-          customTokens,
-          inboundBeta: req.headers.get('anthropic-beta') ?? undefined,
         })
+        // 通道前缀只用于选出口, 上游只认自己的裸 id。必须在选完 provider 之后剥,
+        // 之前剥就分不出 local-claude-opus-5 和 ccr-claude-opus-5 了。
+        anthropicReq.model = upstreamModelId(anthropicReq.model)
         if (!provider) {
           devlog(trace, 'error', { at: 'pickProvider', model: anthropicReq.model })
           return new Response(JSON.stringify({ error: `No provider found for model: ${anthropicReq.model}` }), {

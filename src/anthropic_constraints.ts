@@ -143,8 +143,37 @@ export function resolveDefaultMaxTokens(): number {
  * 它认为合法的 temperature=0，却被网关注入的 thinking 撞成 400。谁造的冲突谁负责收，
  * 所以这里丢采样参数而不是丢 thinking(思考档位是用户显式调的，采样参数多半是客户端默认值)。
  */
+/**
+ * Anthropic's floor for an enabled thinking budget.
+ *
+ * The gateway's own effort→budget table maps `minimal` to 512, which is below
+ * this floor, so every `minimal` request to api.anthropic.com came back with
+ * `thinking.enabled.budget_tokens: Input should be greater than or equal to
+ * 1024` (verified across opus-5 / sonnet-5 / fable-5 / opus-4-8). The tier is
+ * real and worth keeping — cc-relay accepts it, because it encodes the tier in
+ * the model name instead of a budget — so the fix is to clamp at the egress
+ * that has the floor, not to stop advertising the tier.
+ */
+const ANTHROPIC_MIN_THINKING_BUDGET = 1024
+
+/** Room left for visible text after raising max_tokens above the budget. */
+const THINKING_TEXT_HEADROOM = 1024
+
 export function reconcileThinkingSampling(req: AnthropicMessagesRequest): void {
   if (req?.thinking?.type !== 'enabled') return
+  if (
+    typeof req.thinking.budget_tokens === 'number' &&
+    req.thinking.budget_tokens < ANTHROPIC_MIN_THINKING_BUDGET
+  ) {
+    req.thinking.budget_tokens = ANTHROPIC_MIN_THINKING_BUDGET
+  }
+  // max_tokens covers thinking too, and Anthropic rejects a budget that meets
+  // or exceeds it. Raising the ceiling is the only non-destructive fix: lowering
+  // the budget back would silently undo the tier the caller asked for.
+  const budget = req.thinking.budget_tokens
+  if (typeof budget === 'number' && typeof req.max_tokens === 'number' && req.max_tokens <= budget) {
+    req.max_tokens = budget + THINKING_TEXT_HEADROOM
+  }
   if (typeof req.temperature === 'number' && req.temperature !== 1) delete req.temperature
   if (typeof req.top_p === 'number' && req.top_p < 0.95) delete req.top_p
 }

@@ -143,11 +143,28 @@ export function createOpenaiCompatProvider(opts: OpenaiCompatOpts): WireProvider
           | { choices?: Array<{ message?: any; finish_reason?: string }>; usage?: any }
           | null
         if (!json) {
+          // 响应体不是 JSON(网关 HTML 错误页、被截断的 body…)。此前直接 finish()，
+          // 客户端收到的是一个语法完整但零内容的 200。
+          emitter.error({
+            type: 'api_error',
+            message:
+              '[gateway] openai-compat upstream returned a non-streaming body that is not ' +
+              'valid JSON; the turn produced no content',
+          })
           emitter.finish()
           return
         }
         const choice = json.choices?.[0]
         const msg = choice?.message
+        if (!choice) {
+          // 非流式响应的终止信号就是 choices 本身；没有它就没有回合可言。
+          emitter.error({
+            type: 'api_error',
+            message:
+              '[gateway] openai-compat upstream returned a non-streaming body with no choices; ' +
+              'the turn produced no content',
+          })
+        }
         if (msg) {
           if (typeof msg.content === 'string' && msg.content.length > 0) emitter.pushText(msg.content)
           if (Array.isArray(msg.tool_calls)) {
@@ -173,6 +190,8 @@ export function createOpenaiCompatProvider(opts: OpenaiCompatOpts): WireProvider
 
       // Streaming response
       let hadTools = false
+      // Chat Completions 流的终止信号是某个 choice 上的 finish_reason；见不到就是被掐断。
+      let sawTerminal = false
       const toolByIdx = new Map<number, { id: string; name: string; arguments: string }>()
 
       const emitBufferedToolCalls = (): void => {
@@ -189,15 +208,25 @@ export function createOpenaiCompatProvider(opts: OpenaiCompatOpts): WireProvider
 
       for await (const evt of iterSSE(response)) {
         const chunk = tryParseJSON<any>(evt.data)
-        if (!chunk) continue
+        if (!chunk) {
+          emitter.unhandled(evt.event ?? '<unparseable>', evt.data)
+          continue
+        }
         const choice = chunk.choices?.[0]
         const delta = choice?.delta
+
+        // 终止判定单独一行、在所有分支之前：只记账，不参与控制流，出站字节流因此逐字节不变。
+        if (choice?.finish_reason) sawTerminal = true
 
         if (!delta && chunk.usage) {
           emitter.setUsage(normalizeOpenAIUsage(chunk.usage))
           continue
         }
-        if (!delta) continue
+        if (!delta) {
+          // 既无 delta、无 usage、也无 finish_reason 的块没有任何人认领 —— 上游换形状了。
+          if (!choice?.finish_reason) emitter.unhandled('<no-delta>', chunk)
+          continue
+        }
 
         // 1. reasoning_content / reasoning → thinking
         const reasoningDelta = (delta.reasoning_content ?? delta.reasoning) as string | undefined
@@ -248,6 +277,16 @@ export function createOpenaiCompatProvider(opts: OpenaiCompatOpts): WireProvider
       if (hadTools) {
         emitBufferedToolCalls()
         emitter.setStopReason('tool_use')
+      }
+      // 一个 finish_reason 都没见过 = 上游把流掐了。此前照样 finish()，
+      // 客户端拿到的是 stop_reason:'end_turn' 的"正常"收尾。
+      if (!sawTerminal) {
+        emitter.error({
+          type: 'api_error',
+          message:
+            '[gateway] openai-compat upstream stream ended without a finish_reason; ' +
+            'the turn is truncated',
+        })
       }
       emitter.finish()
     },

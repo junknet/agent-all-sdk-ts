@@ -25,6 +25,7 @@ import type {
   AnthropicMessage,
   AnthropicMessagesRequest,
   AnthropicTool,
+  IRLoss,
 } from './types.js'
 import { iterSSE, formatSSE, tryParseJSON } from './sse.js'
 import { devlog } from './devlog.js'
@@ -78,6 +79,7 @@ function decodeTools(
   tools: any[] | undefined,
   namespaceTools: NamespaceToolMap,
   droppedNamespaces: string[],
+  losses: IRLoss[],
 ): AnthropicTool[] | undefined {
   if (!Array.isArray(tools) || tools.length === 0) return undefined
   const out: AnthropicTool[] = []
@@ -108,16 +110,39 @@ function decodeTools(
           required: ['input'],
         },
       })
+    } else if (typeof t.type === 'string' && t.type.length > 0) {
+      // builtins (local_shell / web_search / image_generation) are dropped: the Gemini
+      // backend cannot execute them. codex falls back to function tools for file work.
+      // 丢是唯一选项，无声丢不是：客户端声明了工具，模型侧根本看不到这个符号。
+      losses.push({
+        stage: 'ingress',
+        provider: null,
+        path: `$.tools[type=${t.type}]`,
+        kind: 'dropped',
+        detail:
+          `builtin tool "${t.type}" cannot be executed by the Gemini backend and has no ` +
+          'function-tool equivalent, so it is never exposed to the model on this route',
+      })
     }
-    // builtins (local_shell / web_search / image_generation) are dropped: the Gemini
-    // backend cannot execute them. codex falls back to function tools for file work.
   }
   // Sub-agents first (the whole point of namespacing here); rest keep codex's order, which
   // already trails the bulky built-in apps (codex_apps github/drive) so they drop first.
   groups.sort((a, b) => Number(b.namespace === 'multi_agent_v1') - Number(a.namespace === 'multi_agent_v1'))
   for (const g of groups) {
     if (out.length + g.members.length > MAX_GEMINI_TOOLS) {
+      // droppedNamespaces 是这三处丢失里唯一本来就有信号的，对外行为保持不变；
+      // 内部同时记一条 IRLoss，让它和另外两处走同一套留痕。
       droppedNamespaces.push(`${g.namespace}(${g.members.length})`)
+      losses.push({
+        stage: 'ingress',
+        provider: null,
+        path: `$.tools[namespace=${g.namespace}]`,
+        kind: 'dropped',
+        detail:
+          `tool budget exhausted: ${out.length} of ${MAX_GEMINI_TOOLS} declarations already ` +
+          `admitted and this namespace needs ${g.members.length} more, so the whole group is ` +
+          'dropped (Gemini hard-caps a request at that many function declarations)',
+      })
       continue
     }
     for (const m of g.members) {
@@ -160,9 +185,12 @@ export function decodeResponsesToAnthropic(req: any): {
   request: AnthropicMessagesRequest
   namespaceTools: NamespaceToolMap
   droppedNamespaces: string[]
+  /** 本次入站解码里所有已知的有损翻译，逐条留痕(droppedNamespaces 是其中一类的旧接口)。 */
+  losses: IRLoss[]
 } {
   const namespaceTools: NamespaceToolMap = new Map()
   const droppedNamespaces: string[] = []
+  const losses: IRLoss[] = []
   const systemTexts: string[] = []
   if (typeof req.instructions === 'string' && req.instructions) systemTexts.push(req.instructions)
 
@@ -245,8 +273,28 @@ export function decodeResponsesToAnthropic(req: any): {
       case 'reasoning':
         // server-managed reasoning history (encrypted_content) — not replayable to the
         // Gemini backend; drop. The next user/tool turn carries the actual context.
+        losses.push({
+          stage: 'ingress',
+          provider: null,
+          path: '$.input[type=reasoning]',
+          kind: 'dropped',
+          detail:
+            'server-managed reasoning history (encrypted_content) has no wire field on the ' +
+            'Gemini backend and cannot be replayed; the model loses this turn of reasoning context',
+        })
         break
       default:
+        // 上游(或某个新版 codex)加了个我们不认识的 input item 类型。此前直接 break 掉，
+        // 整段历史凭空消失且无处可查。
+        losses.push({
+          stage: 'ingress',
+          provider: null,
+          path: `$.input[type=${String(item.type)}]`,
+          kind: 'dropped',
+          detail:
+            `unrecognized Responses input item type "${String(item.type)}"; the gateway has no ` +
+            'decoding rule for it, so this item is not forwarded to the model',
+        })
         break
     }
   }
@@ -263,7 +311,7 @@ export function decodeResponsesToAnthropic(req: any): {
     stream: true,
   }
   if (systemTexts.length > 0) out.system = systemTexts.join('\n\n')
-  const tools = decodeTools(req.tools, namespaceTools, droppedNamespaces)
+  const tools = decodeTools(req.tools, namespaceTools, droppedNamespaces, losses)
   if (tools) out.tools = tools
   // codex CLI 根本不发 max_output_tokens(实测抓包 PROTOCOL_REFERENCE §11 的顶层字段
   // 里就没有这个键)，而 Anthropic Messages 的 max_tokens 是必填 —— 于是
@@ -280,7 +328,7 @@ export function decodeResponsesToAnthropic(req: any): {
   if (serviceTier) out.serviceTier = serviceTier
   const tc = toolChoice(req.tool_choice)
   if (tc) out.tool_choice = tc
-  return { request: out, namespaceTools, droppedNamespaces }
+  return { request: out, namespaceTools, droppedNamespaces, losses }
 }
 
 function outputToString(output: unknown): string {

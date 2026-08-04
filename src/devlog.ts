@@ -16,6 +16,7 @@
 
 import { appendFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
+import type { IRLoss } from './types.js'
 
 const LOG_DIR =
   process.env.AGENT_GATEWAY_LOG_DIR ??
@@ -133,21 +134,51 @@ export function devlog(trace: string, phase: string, data: Record<string, unknow
 }
 
 /**
+ * 把有损翻译逐条落盘。
+ *
+ * 一条一条写，**不折叠成计数** —— "本轮丢了 3 处"回答不了"我的 max_tokens 到底生没生效"，
+ * 而那正是唯一需要日志来回答的问题。丢弃是设计内的降级不是崩溃，所以只记录、不改行为。
+ */
+export function devlogLosses(trace: string, losses: readonly IRLoss[] | undefined): void {
+  if (!losses || losses.length === 0) return
+  for (const loss of losses) {
+    devlog(trace, 'ir_loss', {
+      stage: loss.stage,
+      provider: loss.provider,
+      path: loss.path,
+      kind: loss.kind,
+      detail: loss.detail,
+    })
+  }
+}
+
+/**
  * Tee a streaming Response for logging: returns a fresh Response identical to the input
  * while draining a clone into the dev log line-by-line (raw vendor SSE). Non-blocking —
  * the clone is read in the background and never gates the real consumer.
  */
+/**
+ * Split an upstream SSE response into a logging copy and a caller copy.
+ *
+ * Uses `body.tee()` rather than `response.clone()`: clone leaves both branches
+ * reading one underlying source, and for a short, fast stream the logger drains
+ * it before the parser sees anything. That silently produced 200-shaped replies
+ * with no content at all — reproduced on every cc-relay `openai_responses` model
+ * (5 events in ~300ms), which went from 0/4 usable to 4/4 with this change.
+ * `tee()` gives two independent, individually-backpressured streams.
+ */
 export function teeForLog(trace: string, phase: string, response: Response): Response {
   if (!ENABLED || !response.body) return response
-  let clone: Response
+  let logBranch: ReadableStream<Uint8Array>
+  let callerBranch: ReadableStream<Uint8Array>
   try {
-    clone = response.clone()
+    ;[logBranch, callerBranch] = response.body.tee()
   } catch {
     return response
   }
   void (async () => {
     try {
-      const reader = clone.body!.getReader()
+      const reader = logBranch.getReader()
       const decoder = new TextDecoder('utf-8')
       let buf = ''
       let n = 0
@@ -172,7 +203,11 @@ export function teeForLog(trace: string, phase: string, response: Response): Res
       devlog(trace, phase, { error: String(err?.message ?? err) })
     }
   })()
-  return response
+  return new Response(callerBranch, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  })
 }
 
 function safeParse(s: string): unknown {

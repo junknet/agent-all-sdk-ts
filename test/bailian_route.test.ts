@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test'
-import { pickWireProvider, resolveModel } from '../src/index.js'
+import { pickWireProvider, pickRegistryWireProvider, resolveModel } from '../src/index.js'
 import { createOpenaiCompatProvider } from '../src/providers/openai_compat_provider.js'
 
 // DeepSeek platform selection is explicit in the model id. Bare V4 ids default
@@ -28,16 +28,17 @@ test('bare deepseek-v4-flash routes to the official Anthropic endpoint', async (
   }
 })
 
-test('bailian prefix routes dated DeepSeek V4 Flash to DashScope', async () => {
+test('bailian channel routes dated DeepSeek V4 Flash to DashScope', async () => {
   const prevKey = process.env.DASHSCOPE_API_KEY
   const prevBase = process.env.DASHSCOPE_BASE_URL
   process.env.DASHSCOPE_API_KEY = 'sk-bailian-test'
   process.env.DASHSCOPE_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
   try {
-    const provider = pickWireProvider({ model: 'bailian/deepseek-v4-flash-0731' })
+    // Channel-qualified ids are the registry's job now, not pickWireProvider's.
+    const provider = await pickRegistryWireProvider({ model: 'bailian-deepseek-v4-flash-0731' })
     expect(provider?.name).toBe('openai-compat')
     const request = await provider!.buildRequest({
-      model: 'bailian/deepseek-v4-flash-0731',
+      model: 'bailian-deepseek-v4-flash-0731',
       messages: [{ role: 'user', content: 'hello' }],
       stream: true,
     })
@@ -53,9 +54,11 @@ test('bailian prefix routes dated DeepSeek V4 Flash to DashScope', async () => {
   }
 })
 
-test('official route rejects the dated model id without a Bailian prefix', () => {
+test('a bare dated model id is rejected instead of silently hitting the official API', () => {
+  // The dated weights exist only on Bailian; resolving them to a same-looking
+  // official model would bill the wrong platform and return different weights.
   expect(() => pickWireProvider({ model: 'deepseek-v4-flash-0731' })).toThrow(
-    /bailian\/deepseek-v4-flash-0731/,
+    /bailian-deepseek-v4-flash-0731/,
   )
 })
 test('DeepSeek route is not changed by the thinking escalation', () => {
