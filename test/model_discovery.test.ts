@@ -96,6 +96,22 @@ describe('/v1/models discovery contract', () => {
     expect(() => resolveDeepSeekRoute('deepseek-v4-flash-0731')).toThrow(/bailian-/)
   })
 
+  test('publishes the Windsurf Outbox only when its local login is available', () => {
+    const unavailable = buildAvailableModelCatalog({ antigravity: [], codex: [], claude: [], windsurf: false })
+    expect(unavailable.some(model => model.id === 'windsurf-claude-sonnet-5-medium')).toBe(false)
+
+    const available = buildAvailableModelCatalog({ antigravity: [], codex: [], claude: [], windsurf: true })
+    expect(available.find(model => model.id === 'windsurf-claude-sonnet-5-medium')).toMatchObject({
+      supportsImages: true,
+      supportsTools: true,
+      contextWindow: 1000000,
+      maxOutputTokens: 128000,
+      thinkingEfforts: ['medium'],
+      defaultThinkingEffort: 'medium',
+      canDisableThinking: false,
+    })
+  })
+
   test('serializes an OMP-compatible list plus explicit gateway capabilities', () => {
     const response = createModelsListResponse(buildAvailableModelCatalog(sources))
     expect(response.object).toBe('list')
@@ -132,7 +148,7 @@ describe('/v1/models discovery contract', () => {
     expect(response.data[0]?.max_output_tokens).toBeUndefined()
   })
 
-  test('retains every relay-published model with its declared egress protocol', () => {
+  test('retains every relay-published model with its declared outbox protocol', () => {
     const models = parseCcRelayModels({
       data: [
         { id: 'claude-sonnet-5', display_name: 'Claude Sonnet 5', client_protocol: 'anthropic_messages' },

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { ChatIngressAdapter, MessagesIngressAdapter } from '../src/ingress.js'
+import { ChatIngressAdapter, MessagesIngressAdapter } from '../src/inbox.js'
 import { decodeResponsesToAnthropic } from '../src/responses_api.js'
 import { createAnthropicPassthroughProvider } from '../src/providers/anthropic_passthrough_provider.js'
 import { buildAvailableModelCatalog, createModelsListResponse } from '../src/model_catalog.js'

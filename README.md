@@ -11,7 +11,7 @@ Gemini** 各家，用 **Anthropic 格式作为统一中间表示（canonical IR�
 ## 架构：单 IR + 多后端（LLVM 模型）
 
 ```
-  入口协议 (ingress)            统一 IR             出口后端 (egress)
+  入口协议 (inbox)              统一 IR             出口后端 (outbox)
   ├ POST /v1/messages   ┐                    ┌ anthropic-passthrough (Claude)
   ├ POST /v1/chat/...   ┼─ decode ─► Anthropic ─ encode ─┼ codex (ChatGPT Responses)
   └ POST /v1/responses  ┘          canonical          ├ openai-compat (OpenAI/Gemini-OAI)
@@ -33,7 +33,7 @@ src/
 ├ emitter.ts      ── Anthropic SSE 事件发射器（各 provider lift 的目标）
 ├ sse.ts          ── SSE 解析原语（iterSSE / tryParseJSON）
 ├ auth.ts         ── 本地凭据探测 + OAuth 刷新（Claude / Codex Source）
-├ devlog.ts       ── 全量流量 NDJSON 落盘（trace 串联各阶段）
+├ logging.ts      ── Pino 日志装配：等级、格式、脱敏与每请求 trace 上下文
 ├ image_compress.ts ── 入站图片自动压缩（magick，可选）
 ├ passthrough.ts  ── 非 /v1/messages 请求直透判定
 ├ responses_api.ts ── OpenAI Responses ⇄ canonical 编解码（codex 入口用）
@@ -46,8 +46,19 @@ src/
 ```
 
 **import 方向（单向，无环）**：`types` ← 所有；`emitter/sse/auth` ← `providers`；
-`providers/emitter/passthrough/devlog/image_compress/auth` ← `index`；
-`index/sse/responses_api/providers/auth/devlog` ← `server`。同层不横向 import。
+`providers/emitter/passthrough/logging/image_compress/auth` ← `index`；
+`index/sse/responses_api/providers/auth/logging` ← `server`。同层不横向 import。
+
+## 日志（Pino）
+
+日志只写进程标准错误，不创建 NDJSON 文件，也不保存请求、工具结果或 SSE 正文。`server.ts`
+在启动时创建根 Pino logger，并为每个请求注入 `trace`、入口协议、模型、会话和 Outbox 上下文；
+下游只接收这个 child logger。鉴权头会在进入日志字段前脱敏，SSE trace 仅记录序号和字节数。
+
+- `AGENT_GATEWAY_LOG_LEVEL=trace|debug|info|warn|error`，默认 `info`。
+- `AGENT_GATEWAY_LOG_FORMAT=text|json`，默认便于终端阅读的 `text`；生产采集器使用 `json`。
+- `debug`：入站解码、瘦身、出站编译与请求开始；`info`：响应状态和请求完成；`warn`：有损
+  IR 翻译、未识别流事件、重试；`error`：鉴权、出站、流转换失败。
 
 ## 网关侧路由逻辑（本版特有，`index.ts`）
 
@@ -114,12 +125,40 @@ bun install
 bun run src/server.ts          # 默认 :8085（AGENT_GATEWAY_PORT 可改）
 bun run test                   # 仅执行本仓库 test/；避免临时第三方源码被 Bun 递归发现
 bun run test:agent             # OMP 三轮目录/文件/图片真实工具门控（需要本机 OMP + Claude OAuth）
+bash scripts/run_windsurf_agent_gate.sh  # Windsurf 三轮真实工具门控（本机 Devin/Windsurf 登录态）
 ```
 
 `test:agent` 会启动隔离 Gateway、使用本机 OMP 登录态完成同一会话中的目录、文件和图片三轮工具
 调用，并核验持久化 trace。它要求 `${OMP_SOURCE_AGENT_DIR:-~/.omp/agent}` 中存在 `config.yml` /
 `models.yml`，后者包含唯一的 `http://localhost:8085/v1`，且本机 Claude OAuth 可用；因此不放入默认
 单元测试命令。
+
+### Windsurf 专项真实 Agent 门控
+
+`bash scripts/run_windsurf_agent_gate.sh` 是 Windsurf Outbox 的独立验收，不会调用 Claude 或
+Codex 出口。它启动一个带随机端口和 nonce 的本地 Gateway，用显式
+`windsurf-claude-sonnet-5-medium` 模型（可由 `WINDSURF_AGENT_GATE_MODEL_UID` 覆盖，但必须保留
+`windsurf-` 前缀），再通过本机已有 `WINDSURF_API_KEY` 或 Devin/Windsurf CLI 登录态请求实际服务。
+
+它在同一个 OMP session、同一个只读临时夹具中依次提问：非隐藏文件数量、按名字排序后的第二个
+文件完整内容、图片的主体与可见文字。门控不仅检查三条最终回答，还解析 OMP JSONL trace，要求每轮都
+有对应的成功工具调用和结果（目录读取/列举、`02_cobalt.txt`、`06_orange-kite.png`）；因此至少验证三次
+真实工具往返，且图片内容必须经工具结果的 image block 传入模型。Windsurf 账号的可用模型是瞬时状态，若默认
+UID 不在当前账号目录中，显式选择一个已可用的 UID：
+
+```bash
+WINDSURF_AGENT_GATE_MODEL_UID=windsurf-<chat_model_uid> \
+  bash scripts/run_windsurf_agent_gate.sh
+```
+
+脚本只复制 `${OMP_SOURCE_AGENT_DIR:-~/.omp/agent}` 的配置到 `mktemp`，对运行夹具执行 `chmod a-w`，并在
+退出时删除它；Windsurf 模型不会被正式 `/v1/models` 目录静态发布，因此脚本只在该临时 OMP 配置的
+`providers.local-gw.models` 中注册它，绝不修改用户的 `models.yml`。设 `KEEP_AGENT_GATE_ARTIFACTS=1`
+可保留失败时的隔离 trace 用于排障。先做静态检查：
+
+```bash
+bash -n scripts/run_omp_agent_gate.sh scripts/run_windsurf_agent_gate.sh
+```
 
 三出口的两轮 `tool_use → tool_result` 实测使用独立终端启动 Gateway 后执行：
 

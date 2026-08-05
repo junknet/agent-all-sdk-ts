@@ -14,10 +14,10 @@
 import { describe, expect, test } from 'bun:test'
 import {
   IR_PROTOCOLS,
-  INGRESS_CODECS,
-  INGRESS_PATHS,
-  checkUpstreamSupport,
-  createAnthropicUpstream,
+  INBOX_CODECS,
+  INBOX_PATHS,
+  checkOutboxSupport,
+  createAnthropicOutbox,
   type IRProtocol,
 } from 'agent-ir'
 
@@ -28,10 +28,10 @@ describe('agent-ir as a library', () => {
     expect(IR_PROTOCOLS).toContain('anthropic_messages')
     expect(IR_PROTOCOLS).toContain('openai_responses')
     expect(IR_PROTOCOLS).toContain('openai_chat_completions')
-    expect(Object.keys(INGRESS_CODECS).sort()).toEqual([...IR_PROTOCOLS].sort())
-    expect(INGRESS_PATHS['/v1/messages']).toBe('anthropic_messages')
-    expect(INGRESS_PATHS['/v1/responses']).toBe('openai_responses')
-    expect(INGRESS_PATHS['/v1/chat/completions']).toBe('openai_chat_completions')
+    expect(Object.keys(INBOX_CODECS).sort()).toEqual([...IR_PROTOCOLS].sort())
+    expect(INBOX_PATHS['/v1/messages']).toBe('anthropic_messages')
+    expect(INBOX_PATHS['/v1/responses']).toBe('openai_responses')
+    expect(INBOX_PATHS['/v1/chat/completions']).toBe('openai_chat_completions')
   })
 
   test('anthropic /v1/messages body decodes into a complete IRRequest', () => {
@@ -48,7 +48,7 @@ describe('agent-ir as a library', () => {
         },
       ],
     }
-    const codec = INGRESS_CODECS['anthropic_messages']
+    const codec = INBOX_CODECS['anthropic_messages']
     const { request } = codec.readClientRequest(raw, TRACE)
     expect(request.protocol).toBe('anthropic_messages')
     expect(request.model).toBe('claude-opus-5')
@@ -60,38 +60,38 @@ describe('agent-ir as a library', () => {
     expect(request.requires.length).toBeGreaterThan(0)
   })
 
-  test('admission verdict admits a request the anthropic egress can carry', () => {
+  test('admission verdict admits a request the anthropic outbox can carry', () => {
     const raw = {
       model: 'claude-opus-5',
       max_tokens: 4096,
       stream: true,
       messages: [{ role: 'user', content: 'x' }],
     }
-    const { request } = INGRESS_CODECS['anthropic_messages'].readClientRequest(raw, TRACE)
-    const egress = createAnthropicUpstream({
+    const { request } = INBOX_CODECS['anthropic_messages'].readClientRequest(raw, TRACE)
+    const outbox = createAnthropicOutbox({
       baseUrl: 'http://localhost:1',
       apiKey: 'test-key',
       model: 'claude-opus-5',
     })
-    const verdict = checkUpstreamSupport(request, egress.profile)
+    const verdict = checkOutboxSupport(request, outbox.profile, 'anthropic')
     expect(verdict.admitted).toBe(true)
     expect(verdict.unsupported).toHaveLength(0)
   })
 
-  test('egress lower builds an anthropic wire request without hitting the network', async () => {
+  test('outbox lower builds an anthropic wire request without hitting the network', async () => {
     const raw = {
       model: 'claude-opus-5',
       max_tokens: 4096,
       stream: true,
       messages: [{ role: 'user', content: 'say hi' }],
     }
-    const { request } = INGRESS_CODECS['anthropic_messages'].readClientRequest(raw, TRACE)
-    const egress = createAnthropicUpstream({
+    const { request } = INBOX_CODECS['anthropic_messages'].readClientRequest(raw, TRACE)
+    const outbox = createAnthropicOutbox({
       baseUrl: 'http://localhost:1',
       apiKey: 'test-key',
       model: 'claude-opus-5',
     })
-    const lowered = await egress.writeUpstreamRequest(request)
+    const lowered = await outbox.writeOutboxRequest(request)
     expect(lowered.ok).toBe(true)
     if (!lowered.ok) return
     expect(lowered.wire.url).toContain('/v1/messages')

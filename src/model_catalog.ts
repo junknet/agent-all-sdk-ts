@@ -6,6 +6,7 @@ import {
 } from './providers/antigravity_provider.js'
 import { createCodexProvider } from './providers/codex_provider.js'
 import { createOpenaiCompatProvider } from './providers/openai_compat_provider.js'
+import { windsurfCredentialsAreAvailable } from './providers/windsurf_agent_ir_provider.js'
 import type { ModelInfo, ThinkingEffort } from './types.js'
 import { isCcRelayProtocolAware, listCcRelayModels } from './cc_relay.js'
 import {
@@ -14,6 +15,7 @@ import {
   type RegistryEntry,
   type RegistrySource,
 } from './model_registry.js'
+import { createGatewayLogger } from './logging.js'
 
 type CatalogSource = RegistrySource
 
@@ -21,7 +23,9 @@ export interface CatalogSources {
   readonly antigravity: readonly ModelInfo[]
   readonly codex: readonly ModelInfo[]
   readonly claude: readonly ModelInfo[]
-  /** Relay-published ids, absent when cc-relay egress is not configured. */
+  /** Local Devin/Windsurf login makes the Windsurf Outbox available. */
+  readonly windsurf?: boolean
+  /** Relay-published ids, absent when cc-relay outbox is not configured. */
   readonly ccr?: readonly ModelInfo[]
 }
 
@@ -69,12 +73,15 @@ function isReachable(
   entry: RegistryEntry,
   available: Readonly<Record<CatalogSource, ReadonlySet<string>>>,
   relayIds: ReadonlySet<string>,
+  windsurfAvailable: boolean,
 ): boolean {
   switch (entry.channel) {
     case 'local':
       return available[entry.source!].has(entry.upstream)
     case 'ccr':
       return relayIds.has(entry.upstream)
+    case 'windsurf':
+      return windsurfAvailable
     case 'official':
       return !!process.env.DEEPSEEK_API_KEY
     case 'bailian':
@@ -97,7 +104,7 @@ export function buildAvailableModelCatalog(sources: CatalogSources): ModelInfo[]
   }
   const relayIds = idsOf(sources.ccr ?? [])
   return listRegistry()
-    .filter(entry => isReachable(entry, available, relayIds))
+    .filter(entry => isReachable(entry, available, relayIds, sources.windsurf ?? false))
     .map(toModelInfo)
 }
 
@@ -178,9 +185,12 @@ export function createProviderCatalogCache(options: ProviderCatalogCacheOptions 
     options.failureTtlMs ?? MODEL_CATALOG_FAILURE_TTL_MS,
     'failureTtlMs',
   )
+  const catalogLogger = createGatewayLogger()
   const reportFailure = options.reportFailure ?? ((source: CatalogDiscoverySource, error: unknown) => {
-    const message = error instanceof Error ? error.message : error
-    console.error(`listModels ${source} failed:`, message)
+    catalogLogger.warn(
+      { event: 'model_catalog.discovery_failed', source, error },
+      'Provider model catalog discovery failed',
+    )
   })
   const cached = new Map<CatalogDiscoverySource, CachedProviderCatalog>()
   const pending = new Map<CatalogDiscoverySource, Promise<readonly ModelInfo[]>>()
@@ -272,7 +282,7 @@ export async function listAvailableModels(): Promise<ModelInfo[]> {
     isolateCatalog('claude', async () => {
       if (!claudeCredit) return []
       const provider = createAnthropicPassthroughProvider({
-        // Never inherit ANTHROPIC_BASE_URL here: when cc-relay egress is
+        // Never inherit ANTHROPIC_BASE_URL here: when cc-relay outbox is
         // configured it points at the relay, which would make the *local*
         // channel probe the relay and republish relay models as local ones.
         baseURL: 'https://api.anthropic.com',
@@ -288,7 +298,13 @@ export async function listAvailableModels(): Promise<ModelInfo[]> {
     isolateCatalog('ccr', async () => (isCcRelayProtocolAware() ? listCcRelayModels() : [])),
   ])
 
-  return buildAvailableModelCatalog({ antigravity, codex, claude, ccr })
+  return buildAvailableModelCatalog({
+    antigravity,
+    codex,
+    claude,
+    ccr,
+    windsurf: windsurfCredentialsAreAvailable(),
+  })
 }
 
 function positive(value: number | undefined, field: string, modelId: string): number {

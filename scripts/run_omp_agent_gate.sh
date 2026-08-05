@@ -9,6 +9,15 @@ fixture_dir="$project_dir/test/fixtures/agent_gate"
 port="${AGENT_GATEWAY_PORT:-$((20000 + RANDOM % 30000))}"
 base_url="http://127.0.0.1:${port}"
 omp_source_dir="${OMP_SOURCE_AGENT_DIR:-$HOME/.omp/agent}"
+agent_gateway_model_uid="${AGENT_GATE_MODEL_UID:-local-claude-sonnet-5}"
+agent_gate_name="${AGENT_GATE_NAME:-OMP}"
+agent_gate_expected_omp_model="${AGENT_GATE_EXPECTED_OMP_MODEL:-local-gw/${agent_gateway_model_uid}}"
+agent_gate_expected_model_uid="${AGENT_GATE_EXPECTED_MODEL_UID:-${agent_gateway_model_uid}}"
+agent_gate_register_static_model="${AGENT_GATE_REGISTER_STATIC_MODEL:-0}"
+agent_gate_thinking_efforts="${AGENT_GATE_THINKING_EFFORTS:-high}"
+agent_gate_default_thinking_effort="${AGENT_GATE_DEFAULT_THINKING_EFFORT:-high}"
+agent_gate_context_window="${AGENT_GATE_CONTEXT_WINDOW:-200000}"
+agent_gate_max_tokens="${AGENT_GATE_MAX_TOKENS:-16384}"
 omp_test_dir="$(mktemp -d)"
 session_dir="$omp_test_dir/sessions"
 runtime_fixture_dir="$omp_test_dir/fixture"
@@ -18,13 +27,13 @@ gateway_ready_nonce="$(od -An -N16 -tx1 /dev/urandom | tr -d '[:space:]')"
 
 first_prompt='Use tools. Count the non-hidden files directly in the current directory. Reply only: COUNT=<number>.'
 second_prompt='Use tools. Sort the non-hidden file names in the current directory lexicographically, read the second file, then reply with its complete content and nothing else.'
-third_prompt='Use inspect_image on the path 06_orange-kite.png. Reply only with: IMAGE=<subject>; TEXT=<visible text>.'
+third_prompt='Use an available image-capable tool on the path 06_orange-kite.png. Reply only with: IMAGE=<subject>; TEXT=<visible text>.'
 response_format_constraint='This is an automated gate. Follow the user requested response format exactly; do not append a sign-off, emoji, punctuation, markdown, or commentary.'
 
 readonly -a omp_common_args=(
   --cwd "$runtime_fixture_dir"
   --session-dir "$session_dir"
-  --model local-gw/local-claude-sonnet-5
+  --model "local-gw/${agent_gateway_model_uid}"
   --tools glob,read,inspect_image
   --no-extensions
   --no-skills
@@ -51,6 +60,34 @@ trap cleanup EXIT
 
 [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || { echo "invalid gateway port: $port" >&2; exit 2; }
 [[ "$gateway_ready_nonce" =~ ^[0-9a-f]{32}$ ]] || { echo 'failed to generate gateway readiness nonce' >&2; exit 2; }
+[[ "$agent_gateway_model_uid" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+  echo "invalid AGENT_GATE_MODEL_UID: $agent_gateway_model_uid" >&2
+  exit 2
+}
+[[ "$agent_gate_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+  echo "invalid AGENT_GATE_NAME: $agent_gate_name" >&2
+  exit 2
+}
+[[ "$agent_gate_register_static_model" =~ ^[01]$ ]] || {
+  echo "AGENT_GATE_REGISTER_STATIC_MODEL must be 0 or 1" >&2
+  exit 2
+}
+[[ "$agent_gate_thinking_efforts" =~ ^[a-z]+(,[a-z]+)*$ ]] || {
+  echo "AGENT_GATE_THINKING_EFFORTS must be a comma-separated effort list" >&2
+  exit 2
+}
+[[ "$agent_gate_default_thinking_effort" =~ ^[a-z]+$ ]] || {
+  echo "AGENT_GATE_DEFAULT_THINKING_EFFORT must be an effort name" >&2
+  exit 2
+}
+[[ "$agent_gate_context_window" =~ ^[1-9][0-9]*$ ]] || {
+  echo "AGENT_GATE_CONTEXT_WINDOW must be a positive integer" >&2
+  exit 2
+}
+[[ "$agent_gate_max_tokens" =~ ^[1-9][0-9]*$ ]] || {
+  echo "AGENT_GATE_MAX_TOKENS must be a positive integer" >&2
+  exit 2
+}
 
 for required in "$omp_source_dir/config.yml" "$omp_source_dir/models.yml"; do
   [[ -f "$required" ]] || { echo "OMP config missing: $required" >&2; exit 2; }
@@ -71,6 +108,47 @@ rg -F -q "${base_url}/v1" "$omp_test_dir/models.yml" || {
   echo 'failed to point isolated OMP configuration at this gateway' >&2
   exit 2
 }
+
+# OMP modelOverrides only alter models returned by discovery; they cannot add
+# a new one.  Some provider-specific gates deliberately select a model that
+# production discovery does not advertise, so register it through OMP's native
+# providers.<name>.models configuration in the test-local copy only.
+if [[ "$agent_gate_register_static_model" == '1' ]]; then
+  sed -i "/^    modelOverrides:$/i\\
+    models:\\
+      - id: ${agent_gateway_model_uid}\\
+        name: ${agent_gateway_model_uid}\\
+        reasoning: true\\
+        thinking: { mode: anthropic-budget-effort, efforts: [${agent_gate_thinking_efforts//,/ }], defaultLevel: ${agent_gate_default_thinking_effort}, supportsDisplay: true }\\
+        input: [text, image]\\
+        supportsTools: true\\
+        contextWindow: ${agent_gate_context_window}\\
+        maxTokens: ${agent_gate_max_tokens}" "$omp_test_dir/models.yml"
+fi
+
+# Keep capability metadata explicit in the isolated model override.  This is
+# harmless for a static definition and required for a discovered one.
+if ! rg -q "^      ${agent_gateway_model_uid}:$" "$omp_test_dir/models.yml"; then
+  sed -i "/^    modelOverrides:$/a\\
+      ${agent_gateway_model_uid}:\\
+        name: ${agent_gateway_model_uid}\\
+        reasoning: true\\
+        thinking: { mode: anthropic-budget-effort, efforts: [${agent_gate_thinking_efforts//,/ }], defaultLevel: ${agent_gate_default_thinking_effort}, supportsDisplay: true }\\
+        input: [text, image]\\
+        supportsTools: true\\
+        contextWindow: ${agent_gate_context_window}\\
+        maxTokens: ${agent_gate_max_tokens}" "$omp_test_dir/models.yml"
+fi
+rg -q "^      ${agent_gateway_model_uid}:$" "$omp_test_dir/models.yml" || {
+  echo "failed to register isolated OMP model: ${agent_gateway_model_uid}" >&2
+  exit 2
+}
+if [[ "$agent_gate_register_static_model" == '1' ]]; then
+  rg -q "^      - id: ${agent_gateway_model_uid}$" "$omp_test_dir/models.yml" || {
+    echo "failed to add isolated static OMP model: ${agent_gateway_model_uid}" >&2
+    exit 2
+  }
+fi
 
 (cd "$project_dir" && AGENT_GATEWAY_PORT="$port" AGENT_GATEWAY_READY_NONCE="$gateway_ready_nonce" bun run src/server.ts >"$gateway_log" 2>&1) &
 gateway_pid=$!
@@ -127,19 +205,25 @@ third="$(trim_gate_answer "$third_raw")"
 mapfile -t session_files < <(find "$session_dir" -type f -name '*.jsonl' -print)
 [[ "${#session_files[@]}" == 1 ]] || { echo "expected one OMP session trace, found ${#session_files[@]}" >&2; exit 1; }
 session_file="${session_files[0]}"
+AGENT_GATE_EXPECTED_OMP_MODEL="$agent_gate_expected_omp_model" \
+AGENT_GATE_EXPECTED_MODEL_UID="$agent_gate_expected_model_uid" \
 bun -e '
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const [sessionFile, fixtureDirectory] = process.argv.slice(-2);
 const expected = {
-  model: "local-gw/local-claude-sonnet-5",
+  model: process.env.AGENT_GATE_EXPECTED_OMP_MODEL,
+  modelUid: process.env.AGENT_GATE_EXPECTED_MODEL_UID,
   provider: "local-gw",
   firstPrompt: "Use tools. Count the non-hidden files directly in the current directory. Reply only: COUNT=<number>.",
   secondPrompt: "Use tools. Sort the non-hidden file names in the current directory lexicographically, read the second file, then reply with its complete content and nothing else.",
-  thirdPrompt: "Use inspect_image on the path 06_orange-kite.png. Reply only with: IMAGE=<subject>; TEXT=<visible text>.",
+  thirdPrompt: "Use an available image-capable tool on the path 06_orange-kite.png. Reply only with: IMAGE=<subject>; TEXT=<visible text>.",
   secondFileContent: "SECOND-FILE-CONTENT: cobalt is the second fixture.",
 };
+
+expect(typeof expected.model === "string" && expected.model.length > 0, "expected OMP model was not configured");
+expect(typeof expected.modelUid === "string" && expected.modelUid.length > 0, "expected model uid was not configured");
 
 function fail(message) {
   throw new Error(`OMP trace verification failed: ${message}`);
@@ -173,7 +257,7 @@ expect(JSON.stringify(prompts) === JSON.stringify([expected.firstPrompt, expecte
 for (const record of records) {
   if (record.type !== "message" || record.message?.role !== "assistant") continue;
   expect(record.message.provider === expected.provider, `assistant response used unexpected provider: ${record.message.provider}`);
-  expect(record.message.model === "local-claude-sonnet-5", `assistant response used unexpected model: ${record.message.model}`);
+  expect(record.message.model === expected.modelUid, `assistant response used unexpected model: ${record.message.model}`);
   for (const part of record.message.content ?? []) {
     if (part.type === "toolCall") expect(["glob", "read", "inspect_image"].includes(part.name), `disallowed tool appeared in trace: ${part.name}`);
   }
@@ -241,4 +325,5 @@ expect(imageResult.details?.meta?.source?.value === resolve(fixturePath, "06_ora
 expect((imageResult.content ?? []).some((part) => part.type === "image"), "image tool result omitted its image content block");
 ' "$session_file" "$runtime_fixture_dir"
 
-printf 'OMP agent gate passed\nturn1: %s\nturn2: %s\nturn3: %s\n' "$first" "$second" "$third"
+printf '%s agent gate passed\nmodel: %s\nturn1: %s\nturn2: %s\nturn3: %s\n' \
+  "$agent_gate_name" "$agent_gateway_model_uid" "$first" "$second" "$third"

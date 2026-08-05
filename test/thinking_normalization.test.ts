@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { ChatIngressAdapter } from '../src/ingress.js'
-import { MessagesIngressAdapter } from '../src/ingress.js'
+import { ChatIngressAdapter } from '../src/inbox.js'
+import { MessagesIngressAdapter } from '../src/inbox.js'
 import { decodeResponsesToAnthropic } from '../src/responses_api.js'
 import { parseAnthropicThinking, parseReasoningEffort, toAnthropicThinking } from '../src/thinking.js'
 import { createAnthropicPassthroughProvider } from '../src/providers/anthropic_passthrough_provider.js'
@@ -20,7 +20,7 @@ afterEach(() => {
 })
 
 describe('reasoning effort normalization', () => {
-  test('keeps effort semantic in the IR until the Anthropic egress maps it', () => {
+  test('keeps effort semantic in the IR until the Anthropic outbox maps it', () => {
     const intent = parseReasoningEffort('max')
     expect(intent).toEqual({ mode: 'effort', effort: 'max', source: 'client' })
     expect(toAnthropicThinking(intent)).toEqual({ type: 'enabled', budget_tokens: 32_000 })
@@ -59,7 +59,7 @@ describe('reasoning effort normalization', () => {
       .toEqual({ mode: 'auto', source: 'client' })
   })
 
-  test('all three ingress protocols mark an injected default as gateway-owned', () => {
+  test('all three inbox protocols mark an injected default as gateway-owned', () => {
     const messages = new MessagesIngressAdapter().decodeRequest({ messages: [] })
     const chat = new ChatIngressAdapter().decodeRequest({ messages: [] })
     const responses = decodeResponsesToAnthropic({ input: [] }).request
@@ -68,7 +68,7 @@ describe('reasoning effort normalization', () => {
     }
   })
 
-  test('Anthropic egress consumes IR and preserves a client budget exactly', async () => {
+  test('Anthropic outbox consumes IR and preserves a client budget exactly', async () => {
     const provider = createAnthropicPassthroughProvider({ baseURL: 'https://example.invalid', apiKey: 'key' })
     const body = JSON.parse((await provider.buildRequest({
       model: 'claude-test', messages: [], max_tokens: 16,

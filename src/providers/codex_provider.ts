@@ -117,7 +117,7 @@ export function createCodexProvider(opts: CodexOpts): WireProvider {
       const losses: IRLoss[] = []
       if (typeof req.max_tokens === 'number') {
         losses.push({
-          stage: 'egress',
+          stage: 'outbox',
           provider: 'codex',
           path: '$.max_tokens',
           kind: 'dropped',

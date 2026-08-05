@@ -11,7 +11,7 @@
  * Anything wanting Bailian must name the channel.
  *
  * Retire this file once no client sends bare ids: the gateway logs the
- * requested model on every inbound request (`devlog` `requested` field), so
+ * requested model on every inbound request (the structured request log), so
  * "nobody sends bare deepseek ids anymore" is checkable, not a guess.
  */
 

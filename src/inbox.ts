@@ -1,10 +1,15 @@
 import type { IngressAdapter, AnthropicMessagesRequest } from './types.js'
 import { iterSSE, tryParseJSON } from './sse.js'
-import { decodeResponsesToAnthropic, encodeAnthropicToResponsesSSE } from './responses_api.js'
+import {
+  decodeResponsesToAnthropic,
+  encodeAnthropicToResponsesSSE,
+  type NamespaceToolMap,
+} from './responses_api.js'
 import { parseAnthropicThinking, parseReasoningEffort } from './thinking.js'
 import { parseAnthropicSpeed, parseServiceTier } from './service_tier.js'
 import { normalizeToolTurns, resolveDefaultMaxTokens } from './anthropic_constraints.js'
 import { createUsageCollector, toOpenAIChatUsage } from './usage.js'
+import type { GatewayLogger } from './logging.js'
 
 // OpenAI 的 tool_calls.function.arguments 是 JSON 字符串，Anthropic 的
 // tool_use.input 是对象。解析失败时兜成空对象，避免整轮请求因一个坏参数挂掉。
@@ -62,7 +67,7 @@ function convertChatContent(content: unknown): unknown {
 // 请求侧原先完全不接推理字段(只在响应侧回 reasoning_content)，于是任何经
 // /v1/chat/completions 的客户端都无法控制思考档位 —— 下游 harness 的"调推理等级"是死的。
 // 档位→预算由 thinking.ts 统一管理；显式 none/off 必须压过网关默认档位。
-// ── Messages Ingress Adapter (Anthropic /v1/messages) ────────────────
+// ── Messages Inbox Adapter (Anthropic /v1/messages) ────────────────
 export class MessagesIngressAdapter implements IngressAdapter {
   readonly protocol = 'messages'
 
@@ -93,7 +98,7 @@ export class MessagesIngressAdapter implements IngressAdapter {
   }
 }
 
-// ── Chat Ingress Adapter (OpenAI /v1/chat/completions) ───────────────
+// ── Chat Inbox Adapter (OpenAI /v1/chat/completions) ───────────────
 export class ChatIngressAdapter implements IngressAdapter {
   readonly protocol = 'chat'
 
@@ -196,6 +201,7 @@ export class ChatIngressAdapter implements IngressAdapter {
     upstreamResponse: Response,
     originalRequest: any,
     trace: string,
+    context?: { logger?: GatewayLogger },
   ): Promise<Response> {
     const model = originalRequest.model ?? 'openai-compat'
 
@@ -286,8 +292,11 @@ export class ChatIngressAdapter implements IngressAdapter {
             }
             controller.enqueue(encoder.encode(openaiChunk))
           }
-        } catch (err: any) {
-          console.error('SSE transformation failed:', err)
+        } catch (error) {
+          context?.logger?.error(
+            { event: 'inbox.chat_sse_transformation_failed', error },
+            'OpenAI Chat SSE transformation failed',
+          )
         } finally {
           controller.close()
         }
@@ -370,7 +379,7 @@ function translateAnthropicToOpenAISSE(event: { event?: string; data: string }, 
   return null
 }
 
-// ── Responses Ingress Adapter (OpenAI Responses /v1/responses) ───────
+// ── Responses Inbox Adapter (OpenAI Responses /v1/responses) ───────
 export class ResponsesIngressAdapter implements IngressAdapter {
   readonly protocol = 'responses'
 
@@ -383,10 +392,16 @@ export class ResponsesIngressAdapter implements IngressAdapter {
     upstreamResponse: Response,
     originalRequest: any,
     trace: string,
-    context?: any,
+    context?: { namespaceTools?: NamespaceToolMap; logger?: GatewayLogger },
   ): Response {
     const namespaceTools = context?.namespaceTools
-    const stream = encodeAnthropicToResponsesSSE(upstreamResponse, originalRequest.model, trace, namespaceTools)
+    const stream = encodeAnthropicToResponsesSSE(
+      upstreamResponse,
+      originalRequest.model,
+      trace,
+      namespaceTools,
+      context?.logger,
+    )
     return new Response(stream, {
       headers: {
         'Content-Type': 'text/event-stream',
@@ -397,7 +412,7 @@ export class ResponsesIngressAdapter implements IngressAdapter {
   }
 }
 
-// ── Global Ingress Dispatcher ───────────────────────────────────────
+// ── Global Inbox Dispatcher ───────────────────────────────────────
 const ADAPTERS: Record<string, IngressAdapter> = {
   messages: new MessagesIngressAdapter(),
   chat: new ChatIngressAdapter(),
@@ -406,6 +421,6 @@ const ADAPTERS: Record<string, IngressAdapter> = {
 
 export function pickIngressAdapter(protocol: 'messages' | 'chat' | 'responses'): IngressAdapter {
   const adapter = ADAPTERS[protocol]
-  if (!adapter) throw new Error(`Unsupported ingress protocol: ${protocol}`)
+  if (!adapter) throw new Error(`Unsupported inbox protocol: ${protocol}`)
   return adapter
 }

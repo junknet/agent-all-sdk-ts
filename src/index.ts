@@ -3,8 +3,16 @@
  */
 
 import { AnthropicEventEmitter } from './emitter.js'
-import { debugLog, extractRequestBody, shouldPassthrough } from './passthrough.js'
-import { devlog, devlogLosses, redactHeaders, teeForLog, newTrace } from './devlog.js'
+import { extractRequestBody, shouldPassthrough } from './passthrough.js'
+import {
+  createGatewayLogger,
+  createGatewayRequestLogger,
+  createGatewayTraceId,
+  logGatewayIRLosses,
+  redactGatewayHeaders,
+  teeGatewaySseResponseForTraceLogging,
+  type GatewayLogger,
+} from './logging.js'
 import { compressImages } from './image_compress.js'
 import type { WireProvider } from './types.js'
 import { createOpenaiCompatProvider } from './providers/openai_compat_provider.js'
@@ -54,11 +62,11 @@ export function resolveModel(
   model: string | undefined,
   userText: string,
 ): { model: string; escalated: boolean } {
-  // Windsurf is an explicit egress selector too.  Keep its uid untouched:
+  // Windsurf is an explicit outbox selector too.  Keep its uid untouched:
   // a `windsurf-...haiku...` request must not be rewritten to Gemini before
   // provider selection.
   if (windsurfModelUid(model)) return { model: model ?? '', escalated: false }
-  // A channel-qualified id is an explicit choice of egress, so neither the
+  // A channel-qualified id is an explicit choice of outbox, so neither the
   // haiku remap nor the 「思考」 escalation may rewrite it: silently moving
   // ccr-claude-haiku-4-5 onto a local gemini gear would bill the wrong
   // subscription and make the published id a lie.
@@ -81,7 +89,7 @@ export function resolveModel(
 /**
  * Protocol-aware cc-relay selection.  The relay catalog is queried instead of
  * maintaining a local model-family list, so new published models inherit their
- * declared egress protocol without a gateway release.
+ * declared outbox protocol without a gateway release.
  */
 export async function pickCcRelayWireProvider(opts: PickProviderOpts): Promise<WireProvider | null> {
   if (!isCcRelayProtocolAware()) return null
@@ -115,7 +123,7 @@ export async function pickCcRelayWireProvider(opts: PickProviderOpts): Promise<W
   })
 }
 
-/** Build the egress for one relay-published upstream id. */
+/** Build the outbox for one relay-published upstream id. */
 async function ccRelayProviderFor(upstream: string, inboundBeta?: string): Promise<WireProvider> {
   const { baseURL, apiKey } = ccRelayConfig()
   const protocol = await ccRelayProtocolForModel(upstream)
@@ -145,7 +153,6 @@ function localProviderFor(entry: RegistryEntry, opts: PickProviderOpts): WirePro
     const geminiCredit = credits.find(c => c.provider === 'gemini')
     return createAntigravityProvider({
       model: entry.upstream,
-      source: geminiCredit?.type === 'oauth' ? geminiCredit.source : undefined,
     })
   }
   if (entry.source === 'codex') {
@@ -157,7 +164,7 @@ function localProviderFor(entry: RegistryEntry, opts: PickProviderOpts): WirePro
   }
   const claudeCredit = credits.find(c => c.provider === 'claude')
   if (!claudeCredit) throw new Error(`${entry.id} requires an Anthropic credit`)
-  // Pinned, never ANTHROPIC_BASE_URL: with cc-relay egress configured that
+  // Pinned, never ANTHROPIC_BASE_URL: with cc-relay outbox configured that
   // variable points at the relay, which would quietly turn every local-claude-*
   // request into a relay request billed to the wrong account.
   const baseURL = 'https://api.anthropic.com'
@@ -180,7 +187,7 @@ function localProviderFor(entry: RegistryEntry, opts: PickProviderOpts): WirePro
 
 /**
  * Channel-qualified routing.  The `<channel>/` prefix — not the model family —
- * decides the egress, so the id a client selects is exactly the account and
+ * decides the outbox, so the id a client selects is exactly the account and
  * endpoint its request will spend.
  *
  * Returns null for a bare id so legacy clients keep their existing routing;
@@ -200,6 +207,8 @@ export async function pickRegistryWireProvider(
   }
 
   switch (entry.channel) {
+    case 'windsurf':
+      return createWindsurfAgentIrProvider({ model: entry.upstream })
     case 'ccr':
       if (!isCcRelayProtocolAware()) {
         throw new Error(`${entry.id} requires CC_RELAY_PROTOCOL_AWARE`)
@@ -227,7 +236,7 @@ export async function pickRegistryWireProvider(
 }
 
 /**
- * The one provider-selection entrypoint every ingress protocol shares.
+ * The one provider-selection entrypoint every inbox protocol shares.
  *
  * Order is a fallback chain, most specific first: an explicit channel-qualified
  * id wins, then legacy bare ids keep their cc-relay behaviour, then local
@@ -330,7 +339,6 @@ export function pickWireProvider(opts: PickProviderOpts): WireProvider | null {
     const geminiCredit = credits.find(c => c.provider === 'gemini')
     return createAntigravityProvider({
       model: process.env.ANTIGRAVITY_MODEL ?? opts.model ?? ANTIGRAVITY_DEFAULT_MODEL,
-      source: geminiCredit?.type === 'oauth' ? geminiCredit.source : undefined,
     })
   }
 
@@ -407,31 +415,32 @@ export function pickWireProvider(opts: PickProviderOpts): WireProvider | null {
 
 export function createWireAdapter(
   provider: WireProvider,
-): (input: RequestInfo | URL, init?: RequestInit) => Promise<Response> {
-  return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+  logger: GatewayLogger = createGatewayLogger(),
+): (input: Request | URL | string, init?: RequestInit) => Promise<Response> {
+  return async (input: Request | URL | string, init?: RequestInit): Promise<Response> => {
     if (shouldPassthrough(input)) {
       return globalThis.fetch(input as any, init)
     }
 
     const t0 = performance.now()
     const reqHeaders = (init?.headers as Record<string, string> | undefined) ?? {}
-    const trace = reqHeaders['x-dev-trace'] ?? reqHeaders['X-Dev-Trace'] ?? newTrace()
+    const trace = reqHeaders['x-dev-trace'] ?? reqHeaders['X-Dev-Trace'] ?? createGatewayTraceId()
+    const requestLogger = createGatewayRequestLogger(logger, trace, { outbox: provider.name })
     const anthropicReq = await extractRequestBody(init)
     // Shrink oversized images before they reach any provider (size-sensitive backends).
-    await compressImages(anthropicReq, trace)
-    debugLog(provider.name, { route: 'request', model: anthropicReq.model })
-    devlog(trace, 'decoded_ir', {
-      provider: provider.name,
+    await compressImages(anthropicReq, requestLogger)
+    requestLogger.debug({
+      event: 'outbox.request_decoded',
       model: anthropicReq.model,
       messageCount: anthropicReq.messages?.length ?? 0,
       toolCount: anthropicReq.tools?.length ?? 0,
-      request: anthropicReq,
-    })
+    }, 'Decoded inbound request for outbox')
 
     try {
+      requestLogger.debug({ event: 'outbox.prepare_started' }, 'Preparing outbox credentials and transport')
       await provider.prepare?.()
     } catch (err: any) {
-      devlog(trace, 'error', { provider: provider.name, at: 'prepare', message: String(err?.message ?? err) })
+      requestLogger.error({ event: 'outbox.prepare_failed', error: err }, 'Outbox preparation failed')
       return errorResponse(502, `wire ${provider.name} prepare failed: ${err?.message ?? err}`)
     }
 
@@ -439,41 +448,45 @@ export function createWireAdapter(
     try {
       prepared = await provider.buildRequest(anthropicReq)
     } catch (err: any) {
-      devlog(trace, 'error', { provider: provider.name, at: 'buildRequest', message: String(err?.message ?? err) })
+      requestLogger.error({ event: 'outbox.request_build_failed', error: err }, 'Outbox request compilation failed')
       return errorResponse(500, `wire ${provider.name} buildRequest failed: ${err?.message ?? err}`)
     }
-    // 出口翻译丢掉的东西逐条落盘。provider 没有 trace，所以由这里代记。
-    devlogLosses(trace, prepared.losses)
-    devlog(trace, 'upstream_request', {
-      provider: provider.name,
+    // 出口翻译丢掉的东西逐条告警。provider 没有 trace，所以由这里注入上下文。
+    logGatewayIRLosses(requestLogger, prepared.losses)
+    requestLogger.debug({
+      event: 'outbox.request_compiled',
       url: prepared.url,
-      headers: redactHeaders(prepared.headers),
-      body: safeParseJSON(prepared.body),
-    })
+      headers: redactGatewayHeaders(prepared.headers),
+      bodyBytes: prepared.body instanceof Uint8Array ? prepared.body.byteLength : prepared.body.length,
+    }, 'Compiled outbox request')
 
     let upstream: Response
     try {
+      requestLogger.debug({ event: 'outbox.request_started' }, 'Sending outbox request')
       upstream = await globalThis.fetch(prepared.url, {
         method: 'POST',
         headers: prepared.headers,
         // lib.dom from the legacy project omits Uint8Array from BodyInit;
         // Bun fetch accepts it and Connect/protobuf requires those raw bytes.
-        body: prepared.body as unknown as BodyInit,
+        body: prepared.body as any,
       })
     } catch (err: any) {
-      devlog(trace, 'error', { provider: provider.name, at: 'fetch', message: String(err?.message ?? err) })
+      requestLogger.error({ event: 'outbox.request_failed', error: err }, 'Outbox request failed')
       return errorResponse(502, `wire ${provider.name} upstream fetch failed: ${err?.message ?? err}`)
     }
 
-    devlog(trace, 'upstream_status', {
-      provider: provider.name,
+    requestLogger.info({
+      event: 'outbox.response_received',
       status: upstream.status,
-      headers: redactHeaders(upstream.headers),
-    })
+      headers: redactGatewayHeaders(upstream.headers),
+    }, 'Received outbox response')
 
     if (!upstream.ok) {
       const text = await upstream.text().catch(() => '')
-      devlog(trace, 'error', { provider: provider.name, at: 'upstream', status: upstream.status, body: text.slice(0, 4000) })
+      requestLogger.error(
+        { event: 'outbox.response_rejected', status: upstream.status, responseBytes: text.length },
+        'Outbox returned an unsuccessful response',
+      )
       return errorResponse(upstream.status, `wire ${provider.name} upstream ${upstream.status}: ${text}`)
     }
 
@@ -489,28 +502,35 @@ export function createWireAdapter(
     let attemptResp: Response | null = upstream
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       if (attempt > 1) {
-        devlog(trace, 'retry', { provider: provider.name, attempt, reason: 'unusable_upstream' })
+        requestLogger.warn(
+          { event: 'outbox.retry_started', attempt, reason: 'unusable_upstream' },
+          'Retrying unusable outbox stream',
+        )
         try {
           attemptResp = await globalThis.fetch(prepared.url, {
             method: 'POST',
             headers: prepared.headers,
-            body: prepared.body as unknown as BodyInit,
+            body: prepared.body as any,
           })
         } catch (err: any) {
-          devlog(trace, 'error', { at: 'retry_fetch', attempt, message: String(err?.message ?? err) })
+          requestLogger.error({ event: 'outbox.retry_failed', attempt, error: err }, 'Outbox retry request failed')
           break
         }
         if (!attemptResp.ok) {
           const t = await attemptResp.text().catch(() => '')
-          devlog(trace, 'error', { at: 'retry_upstream', attempt, status: attemptResp.status, body: t.slice(0, 2000) })
+          requestLogger.error(
+            { event: 'outbox.retry_rejected', attempt, status: attemptResp.status, responseBytes: t.length },
+            'Outbox retry returned an unsuccessful response',
+          )
           break
         }
       }
-      const logged = teeForLog(trace, 'upstream_sse', attemptResp)
-      const em = new AnthropicEventEmitter(trace)
+      const logged = teeGatewaySseResponseForTraceLogging(requestLogger, attemptResp)
+      const em = new AnthropicEventEmitter(trace, requestLogger)
       try {
         await provider.parseStream(logged, em)
       } catch (err: any) {
+        requestLogger.error({ event: 'outbox.stream_parse_failed', attempt, error: err }, 'Outbox stream parsing failed')
         em.error(err)
       } finally {
         if (!em['finished' as keyof typeof em]) {
@@ -522,19 +542,22 @@ export function createWireAdapter(
     }
 
     const usage = finalEmitter.getUsage()
-    devlog(trace, 'done', {
-      provider: provider.name,
+    requestLogger.info({
+      event: 'gateway.request_completed',
       durationMs: Math.round(performance.now() - t0),
       toolUseCount: finalEmitter.getToolUseCount(),
       usage,
       unusable: finalEmitter.isUnusable(),
       unhandledEvents: finalEmitter.getUnhandledCount(),
-    })
+    }, 'Completed gateway request')
 
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
         for (const chunk of finalEmitter.drain()) {
-          devlog(trace, 'outbound_sse', { raw: chunk.trim() })
+          requestLogger.trace(
+            { event: 'inbox.anthropic_sse_frame', bytes: chunk.length },
+            'Encoded Anthropic SSE frame',
+          )
           controller.enqueue(encoder.encode(chunk))
         }
         controller.close()
@@ -550,15 +573,6 @@ export function createWireAdapter(
         'x-request-id': messageId,
       },
     })
-  }
-}
-
-function safeParseJSON(body: string | Uint8Array): unknown {
-  if (body instanceof Uint8Array) return `<binary ${body.byteLength} bytes>`
-  try {
-    return JSON.parse(body)
-  } catch {
-    return body
   }
 }
 

@@ -8,7 +8,7 @@ import {
 import { resolveModel } from '../src/index.js'
 
 describe('Windsurf agent-ir provider', () => {
-  test('only the explicit windsurf prefix selects this egress', () => {
+  test('only the explicit windsurf prefix selects this outbox', () => {
     expect(windsurfModelUid('windsurf-claude-sonnet-5-medium')).toBe('claude-sonnet-5-medium')
     expect(windsurfModelUid('claude-sonnet-5-medium')).toBeNull()
     expect(windsurfModelUid('windsurf-')).toBeNull()
@@ -69,5 +69,8 @@ windsurf_api_key = ["not", "a string"]
     expect(prepared.headers['content-type']).toBe('application/connect+proto')
     expect(prepared.body).toBeInstanceOf(Uint8Array)
     expect((prepared.body as Uint8Array).byteLength).toBeGreaterThan(5)
+    expect(prepared.losses).toEqual(expect.arrayContaining([
+      expect.objectContaining({ stage: 'outbox', provider: 'windsurf' }),
+    ]))
   })
 })

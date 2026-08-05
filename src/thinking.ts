@@ -50,7 +50,7 @@ export function toAnthropicThinking(intent: ReasoningIntent | undefined): Anthro
   return { type: 'enabled', budget_tokens: EFFORT_BUDGET[intent.effort] }
 }
 
-/** Codex Responses accepts only these three tiers; numeric budgets are an unavoidable egress downgrade. */
+/** Codex Responses accepts only these three tiers; numeric budgets are an unavoidable outbox downgrade. */
 export function toCodexEffort(intent: ReasoningIntent | undefined): 'low' | 'medium' | 'high' | undefined {
   if (!intent || intent.mode === 'disabled' || intent.mode === 'auto') return undefined
   if (intent.mode === 'effort') {
@@ -61,7 +61,7 @@ export function toCodexEffort(intent: ReasoningIntent | undefined): 'low' | 'med
   return intent.budgetTokens <= 1_024 ? 'low' : intent.budgetTokens <= 4_096 ? 'medium' : 'high'
 }
 
-/** Gemini's wire uses a budget; its model gear may override this at egress. */
+/** Gemini's wire uses a budget; its model gear may override this at outbox. */
 export function toGeminiBudget(intent: ReasoningIntent | undefined): number | undefined {
   if (!intent || intent.mode === 'disabled' || intent.mode === 'auto') return undefined
   return intent.mode === 'budget' ? intent.budgetTokens : EFFORT_BUDGET[intent.effort]

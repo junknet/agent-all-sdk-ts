@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { ChatIngressAdapter, MessagesIngressAdapter } from '../src/ingress.js'
+import { ChatIngressAdapter, MessagesIngressAdapter } from '../src/inbox.js'
 
 // OpenAI Chat 里一次并行工具调用 = 一条带多个 tool_calls 的 assistant + 多条独立的
 // role:'tool'。Anthropic 要求这些 tool_result 全在紧随其后的**一条** user 消息里。

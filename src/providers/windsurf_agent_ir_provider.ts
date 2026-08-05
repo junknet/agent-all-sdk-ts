@@ -1,7 +1,7 @@
 /**
  * Windsurf adapter backed by agent-ir.
  *
- * `agent-all-sdk-ts` owns HTTP ingress/SSE egress and credential discovery;
+ * `agent-all-sdk-ts` owns HTTP inbox/SSE outbox and credential discovery;
  * `agent-ir` owns the Connect/protobuf lowering and lifting contract.  Keeping
  * that seam here means the gateway never reimplements Windsurf wire details.
  */
@@ -9,9 +9,9 @@ import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import {
-  INGRESS_CODECS,
-  checkUpstreamSupport,
-  createWindsurfUpstream,
+  INBOX_CODECS,
+  checkOutboxSupport,
+  createWindsurfOutbox,
   type IREvent,
   type IRLoss as AgentIrLoss,
 } from 'agent-ir'
@@ -85,10 +85,20 @@ export function loadWindsurfCredentials(env: NodeJS.ProcessEnv = process.env): L
   }
 }
 
+/** True only when this process can construct the Windsurf Outbox without prompting. */
+export function windsurfCredentialsAreAvailable(env: NodeJS.ProcessEnv = process.env): boolean {
+  try {
+    loadWindsurfCredentials(env)
+    return true
+  } catch {
+    return false
+  }
+}
+
 function toGatewayLoss(loss: AgentIrLoss): IRLoss {
   return {
-    stage: loss.stage,
-    provider: loss.provider,
+    stage: loss.stage === 'inbox' ? 'inbox' : 'outbox',
+    provider: loss.outbox,
     path: loss.path,
     kind: loss.kind,
     detail: loss.detail,
@@ -119,7 +129,7 @@ export function createWindsurfAgentIrProvider(options: WindsurfAgentIrProviderOp
   const credentials = options.apiKey
     ? { apiKey: options.apiKey, ...(options.server ? { server: options.server } : {}) }
     : loadWindsurfCredentials()
-  const upstream = createWindsurfUpstream({
+  const outbox = createWindsurfOutbox({
     model: options.model,
     apiKey: credentials.apiKey,
     ...(options.server ?? credentials.server ? { server: options.server ?? credentials.server } : {}),
@@ -129,18 +139,18 @@ export function createWindsurfAgentIrProvider(options: WindsurfAgentIrProviderOp
     name: 'windsurf',
 
     async buildRequest(req: AnthropicMessagesRequest): Promise<WirePreparedRequest> {
-      const { request, losses: ingressLosses } = INGRESS_CODECS.anthropic_messages.readClientRequest(
+      const { request, losses: ingressLosses } = INBOX_CODECS.anthropic_messages.readClientRequest(
         req,
         'agent-all-windsurf',
       )
-      const verdict = checkUpstreamSupport(request, upstream.profile)
+      const verdict = checkOutboxSupport(request, outbox.profile, 'windsurf')
       if (!verdict.admitted) {
         const details = verdict.unsupported
-          .map(item => `${item.path}: ${item.capability}`)
+          .map(item => `${item.paths.join(', ')}: ${item.capability}`)
           .join('; ')
         throw new Error(`Windsurf cannot represent this request: ${details}`)
       }
-      const lowered = await upstream.writeUpstreamRequest(request)
+      const lowered = await outbox.writeOutboxRequest(request)
       const losses = [...ingressLosses, ...lowered.losses].map(toGatewayLoss)
       if (!lowered.ok) {
         const details = lowered.problems.map(problem => `${problem.path}: ${problem.detail}`).join('; ')
@@ -155,7 +165,7 @@ export function createWindsurfAgentIrProvider(options: WindsurfAgentIrProviderOp
     },
 
     async parseStream(response: Response, emitter: AnthropicEventEmitter): Promise<void> {
-      for await (const event of upstream.readUpstreamResponse(response)) {
+      for await (const event of outbox.readOutboxResponse(response)) {
         switch (event.kind) {
           case 'messageStart':
             emitter.start({ model: event.model })

@@ -4,7 +4,7 @@
 
 import { formatSSE, tryParseJSON } from './sse.js'
 import { pickAnthropicUsage } from './usage.js'
-import { devlog } from './devlog.js'
+import type { GatewayLogger } from './logging.js'
 
 type BlockType = 'text' | 'thinking' | 'tool_use'
 
@@ -42,11 +42,13 @@ export class AnthropicEventEmitter {
   private unhandledCount = 0
   private upstreamTerminalSeen = false
   private readonly trace: string
+  private readonly logger: GatewayLogger | undefined
 
   // trace 只用来把 unhandled 归到某一次请求上；provider 单测里不给也能跑，
   // 那时日志归到 'untraced'，计数照常。
-  constructor(trace?: string) {
+  constructor(trace?: string, logger?: GatewayLogger) {
     this.trace = trace && trace.length > 0 ? trace : 'untraced'
+    this.logger = logger
   }
 
   /**
@@ -62,11 +64,16 @@ export class AnthropicEventEmitter {
    */
   unhandled(rawType: string, raw: unknown): void {
     this.unhandledCount += 1
-    devlog(this.trace, 'upstream_event_unhandled', {
-      rawType,
-      raw,
-      unhandledCount: this.unhandledCount,
-    })
+    this.logger?.warn(
+      {
+        event: 'outbox.unhandled_stream_event',
+        rawType,
+        rawKind: raw === null ? 'null' : Array.isArray(raw) ? 'array' : typeof raw,
+        rawBytes: safeSerializedByteLength(raw),
+        unhandledCount: this.unhandledCount,
+      },
+      'Outbox emitted an unhandled stream event',
+    )
   }
 
   getUnhandledCount(): number {
@@ -358,5 +365,13 @@ export class AnthropicEventEmitter {
         }),
       )
     }
+  }
+}
+
+function safeSerializedByteLength(value: unknown): number | undefined {
+  try {
+    return new TextEncoder().encode(JSON.stringify(value)).byteLength
+  } catch {
+    return undefined
   }
 }

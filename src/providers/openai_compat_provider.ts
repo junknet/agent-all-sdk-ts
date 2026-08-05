@@ -76,7 +76,7 @@ export function createOpenaiCompatProvider(opts: OpenaiCompatOpts): WireProvider
     ? opts.model || 'gpt-4o'
     : process.env.OPENAI_MODEL || process.env.OPENAI_COMPAT_MODEL || opts.model || 'gpt-4o'
   const supportsImages = opts.supportsImages ?? true
-  const authHeaders =
+  const authHeaders: Record<string, string> =
     opts.authScheme === 'x-api-key'
       ? { 'x-api-key': opts.apiKey }
       : { Authorization: `Bearer ${opts.apiKey}` }
@@ -111,18 +111,6 @@ export function createOpenaiCompatProvider(opts: OpenaiCompatOpts): WireProvider
       }
 
       const bodyStr = JSON.stringify(body)
-      if (process.env.BENCH_LOG_DIR) {
-        try {
-          const fs = await import('fs/promises')
-          const path = await import('path')
-          const dir = process.env.BENCH_LOG_DIR
-          await fs.mkdir(dir, { recursive: true })
-          await fs.appendFile(
-            path.join(dir, 'wire-requests.ndjson'),
-            JSON.stringify({ ts: new Date().toISOString(), provider: 'openai-compat', body: JSON.parse(bodyStr) }) + '\n',
-          )
-        } catch {}
-      }
       return {
         url: `${opts.baseURL.replace(/\/$/, '')}/chat/completions`,
         headers: {

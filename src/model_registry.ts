@@ -6,7 +6,7 @@
  * that an upstream model is *reachable*; they never decide the public id, and
  * for cc-relay they carry no capability metadata at all.
  *
- * Every published id is `<channel>-<model>`.  The prefix names the egress
+ * Every published id is `<channel>-<model>`.  The prefix names the outbox
  * channel rather than the model family, because the same weights reached
  * through different channels are different products: `local-claude-opus-5`
  * spends a local OAuth subscription while `ccr-claude-opus-5` spends relay
@@ -23,7 +23,7 @@ import { readFileSync } from 'fs'
 import * as path from 'path'
 import type { ModelInfo, ThinkingEffort } from './types.js'
 
-export type RegistryChannel = 'local' | 'ccr' | 'official' | 'bailian'
+export type RegistryChannel = 'local' | 'windsurf' | 'ccr' | 'official' | 'bailian'
 
 /** Availability probe that gates a `local` entry; other channels are env-gated. */
 export type RegistrySource = 'antigravity' | 'codex' | 'claude'
@@ -51,7 +51,7 @@ export interface RegistryEntry {
   readonly verified: boolean
 }
 
-const CHANNELS: readonly RegistryChannel[] = ['local', 'ccr', 'official', 'bailian']
+const CHANNELS: readonly RegistryChannel[] = ['local', 'windsurf', 'ccr', 'official', 'bailian']
 const SOURCES: readonly RegistrySource[] = ['antigravity', 'codex', 'claude']
 const EFFORTS: readonly ThinkingEffort[] = [
   'minimal',
@@ -209,7 +209,7 @@ export function hasChannelPrefix(modelId: string): boolean {
 /**
  * Strip the channel prefix for the wire.
  *
- * The prefix exists to pick an egress; no upstream knows about it.  Providers
+ * The prefix exists to pick an outbox; no upstream knows about it.  Providers
  * that re-read `req.model` when building their request (antigravity resolves it
  * through its own route table) would otherwise send `local/gemini-3.6-flash-low`
  * upstream and get a 404 for a model nobody publishes.

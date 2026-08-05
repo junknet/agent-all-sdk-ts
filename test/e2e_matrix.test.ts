@@ -30,7 +30,7 @@ describe('E2E Matrix Tests', () => {
       expect(models).toBeDefined()
       expect(models!.length).toBeGreaterThan(0)
       console.log(`[E2E Antigravity] Listed ${models!.length} models. First: ${models![0].id} (${models![0].name})`)
-    })
+    }, 30_000)
 
     test('Quota Information', async () => {
       if (skip) test.skip('No Antigravity credentials found')
@@ -118,7 +118,7 @@ describe('E2E Matrix Tests', () => {
       expect(models).toBeDefined()
       expect(models!.length).toBeGreaterThan(0)
       console.log(`[E2E Codex] Listed ${models!.length} models. First: ${models![0].id}`)
-    })
+    }, 30_000)
 
     test('Quota Information', async () => {
       if (skip) test.skip('No Codex credentials found')

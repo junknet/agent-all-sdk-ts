@@ -28,7 +28,7 @@ export type ThinkingEffort = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | '
  * Provider-neutral reasoning intent.  This is deliberately not an Anthropic
  * `thinking` object: some callers express a semantic tier while Anthropic and
  * Gemini express a numeric budget.  Keeping the original representation makes
- * conversion an egress concern instead of a lossy ingress side effect.
+ * conversion an outbox concern instead of a lossy inbox side effect.
  */
 export type ReasoningIntent =
   | { readonly mode: 'disabled'; readonly source: 'client' | 'gateway-default' }
@@ -100,11 +100,11 @@ export interface AnthropicMessagesRequest {
   top_k?: number
   stop_sequences?: string[]
   stream?: boolean
-  /** Canonical, provider-neutral reasoning intent used after ingress decoding. */
+  /** Canonical, provider-neutral reasoning intent used after inbox decoding. */
   reasoning?: ReasoningIntent
-  /** Canonical, provider-neutral scheduling intent used after ingress decoding. */
+  /** Canonical, provider-neutral scheduling intent used after inbox decoding. */
   serviceTier?: ServiceTierIntent
-  /** Anthropic wire input only; ingress normalizes it into `reasoning`. */
+  /** Anthropic wire input only; inbox normalizes it into `reasoning`. */
   thinking?: { type: 'enabled' | 'disabled'; budget_tokens?: number }
   metadata?: Record<string, unknown>
   [key: string]: unknown
@@ -122,8 +122,8 @@ export interface AnthropicMessagesRequest {
  * 它只写日志，不改出站字节流 —— 有损是既成事实，记下来是为了可诊断，不是为了改行为。
  */
 export interface IRLoss {
-  /** ingress = 入站解码丢的；egress = 出站 buildRequest 丢的；lift = 上游响应回抬时丢的。 */
-  readonly stage: 'ingress' | 'egress' | 'lift'
+  /** inbox = 入站解码丢的；outbox = 出站 buildRequest 丢的；lift = 上游响应回抬时丢的。 */
+  readonly stage: 'inbox' | 'outbox' | 'lift'
   /** 丢在哪个出口上；入站阶段还没选出口时为 null。 */
   readonly provider: string | null
   /** 丢的是哪个字段，用 IR 路径表示，如 '$.max_tokens'。 */
@@ -139,7 +139,7 @@ export interface WirePreparedRequest {
   /** JSON 出口用 string；Connect/protobuf 等二进制出口必须原样交给 fetch。 */
   body: string | Uint8Array
   /**
-   * 本次 egress 翻译丢掉的东西。调用方(createWireAdapter)持有 trace，负责逐条落盘 ——
+   * 本次 outbox 翻译丢掉的东西。调用方(createWireAdapter)持有 trace，负责逐条落盘 ——
    * provider 自己没有 trace，把 loss 带出去比在 provider 里硬凑一个日志上下文干净。
    */
   losses?: IRLoss[]

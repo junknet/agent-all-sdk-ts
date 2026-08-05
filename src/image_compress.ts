@@ -13,7 +13,7 @@
  */
 
 import type { AnthropicContentBlock, AnthropicMessagesRequest } from './types.js'
-import { devlog } from './devlog.js'
+import type { GatewayLogger } from './logging.js'
 
 const MAX_DIM = 2048
 const JPEG_QUALITY = 80
@@ -67,7 +67,10 @@ function collectImageBlocks(content: unknown, acc: AnthropicContentBlock[]): voi
  * Compress all base64 images in the request in place. No-op when there are none.
  * Concurrent across images; per-image failures leave that image untouched.
  */
-export async function compressImages(req: AnthropicMessagesRequest, trace?: string): Promise<void> {
+export async function compressImages(
+  req: AnthropicMessagesRequest,
+  logger?: GatewayLogger,
+): Promise<void> {
   const blocks: AnthropicContentBlock[] = []
   for (const m of req.messages ?? []) collectImageBlocks(m.content, blocks)
   if (blocks.length === 0) return
@@ -88,7 +91,8 @@ export async function compressImages(req: AnthropicMessagesRequest, trace?: stri
     }),
   )
 
-  if (trace) {
-    devlog(trace, 'image_compress', { images: blocks.length, recompressed, savedBase64Chars: savedChars })
-  }
+  logger?.debug(
+    { event: 'inbox.image_compression_completed', images: blocks.length, recompressed, savedBase64Chars: savedChars },
+    'Completed inbound image compression',
+  )
 }

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { ChatIngressAdapter, MessagesIngressAdapter } from '../src/ingress.js'
+import { ChatIngressAdapter, MessagesIngressAdapter } from '../src/inbox.js'
 import { createAnthropicPassthroughProvider } from '../src/providers/anthropic_passthrough_provider.js'
 import { createAntigravityProvider } from '../src/providers/antigravity_provider.js'
 import { createCodexProvider } from '../src/providers/codex_provider.js'
@@ -63,7 +63,7 @@ describe('service tier normalization', () => {
     expect(anthropic.reasoning).toBeUndefined()
   })
 
-  test('unsupported tier values fail at ingress instead of becoming an invented wire field', () => {
+  test('unsupported tier values fail at inbox instead of becoming an invented wire field', () => {
     expect(() => decodeResponsesToAnthropic({ input: 'hello', service_tier: 'flex' }))
       .toThrow(/Unsupported service tier 'flex'/)
     expect(() => new MessagesIngressAdapter().decodeRequest({ messages: [], speed: 'instant' }))

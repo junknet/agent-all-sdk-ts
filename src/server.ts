@@ -4,11 +4,16 @@
 
 import { selectWireProvider, createWireAdapter, resolveModel, latestUserInput } from './index.js'
 import { upstreamModelId } from './model_registry.js'
-import { pickIngressAdapter } from './ingress.js'
+import { pickIngressAdapter } from './inbox.js'
 import { decodeResponsesToAnthropic, encodeAnthropicToResponsesSSE } from './responses_api.js'
 import { createModelsListResponse, listAvailableModels } from './model_catalog.js'
 import { slimAnthropicRequest } from './slim.js'
-import { devlog, devlogLosses, newTrace, setTraceMeta } from './devlog.js'
+import {
+  createGatewayLogger,
+  createGatewayRequestLogger,
+  createGatewayTraceId,
+  logGatewayIRLosses,
+} from './logging.js'
 
 // Identify the connecting harness + conversation session from inbound headers/body, so
 // logs split cleanly along two axes: WHICH harness (codex-g / claude-g / jcode) and
@@ -47,9 +52,10 @@ const PORT = Number(process.env.AGENT_GATEWAY_PORT ?? 8085)
 // response, proves that the harness reached the process it just launched and
 // not an unrelated gateway already bound to the selected port.
 const AGENT_GATEWAY_READY_NONCE = process.env.AGENT_GATEWAY_READY_NONCE
+const gatewayLogger = createGatewayLogger()
 
 // ── HTTP Gateway Server ─────────────────────────────────────────────
-console.log(`Starting TS Gateway Server on port ${PORT}...`)
+gatewayLogger.info({ event: 'gateway.server_started', port: PORT }, 'Starting TypeScript gateway server')
 
 Bun.serve({
   port: PORT,
@@ -60,6 +66,11 @@ Bun.serve({
   idleTimeout: 255,
   async fetch(req) {
     const url = new URL(req.url)
+    const requestTrace = req.headers.get('x-dev-trace') ?? createGatewayTraceId()
+    const requestLogger = createGatewayRequestLogger(gatewayLogger, requestTrace, {
+      method: req.method,
+      path: url.pathname,
+    })
 
     if (
       AGENT_GATEWAY_READY_NONCE &&
@@ -83,6 +94,7 @@ Bun.serve({
       // OpenAI SDK 用 Authorization: Bearer；Anthropic SDK 用 x-api-key——两者都接受
       const token = bearer || (req.headers.get('x-api-key') ?? '')
       if (token !== requiredKey) {
+        requestLogger.warn({ event: 'inbox.authentication_rejected' }, 'Rejected unauthenticated gateway request')
         return new Response(
           JSON.stringify({ error: { message: 'Unauthorized', type: 'authentication_error' } }),
           { status: 401, headers: { 'Content-Type': 'application/json' } },
@@ -90,11 +102,13 @@ Bun.serve({
       }
     }
 
-    console.log(`HIT: ${req.method} ${url.pathname}`)
+    requestLogger.debug({ event: 'inbox.request_received' }, 'Received gateway request')
 
     // 1. Models endpoint — curated public catalog filtered by available credentials
     if (url.pathname === '/v1/models' && req.method === 'GET') {
+      requestLogger.debug({ event: 'inbox.models_requested' }, 'Listing available models')
       const models = await listAvailableModels()
+      requestLogger.info({ event: 'inbox.models_completed', modelCount: models.length }, 'Listed available models')
       return new Response(JSON.stringify(createModelsListResponse(models)), {
         headers: { 'Content-Type': 'application/json' },
       })
@@ -110,7 +124,7 @@ Bun.serve({
 
     // 2. Anthropic Messages API (claude-g)
     if (url.pathname === '/v1/messages' && req.method === 'POST') {
-      const trace = newTrace()
+      const trace = requestTrace
       try {
         const bodyText = await req.text()
         const body = JSON.parse(bodyText)
@@ -124,19 +138,27 @@ Bun.serve({
         anthropicReq.model = resolved.model
 
         const slim = slimAnthropicRequest(anthropicReq)
-        if (slim.on) console.log(`[slim] messages: tools ${slim.toolsBefore}→${slim.toolsAfter}, system ${slim.sysBefore}→${slim.sysAfter} chars`)
-
-        setTraceMeta(trace, { harness: cid.harness, model: anthropicReq.model, session: cid.session, ua: cid.ua, requested: origModel, escalated: resolved.escalated })
-        devlog(trace, 'inbound', {
-          protocol: 'messages',
-          path: url.pathname,
+        const inboundLogger = createGatewayRequestLogger(requestLogger, trace, {
+          harness: cid.harness,
           model: anthropicReq.model,
+          session: cid.session,
+          requestedModel: origModel,
+          modelEscalated: resolved.escalated,
+        })
+        if (slim.on) {
+          inboundLogger.debug(
+            { event: 'inbox.request_slimmed', toolsBefore: slim.toolsBefore, toolsAfter: slim.toolsAfter, systemBefore: slim.sysBefore, systemAfter: slim.sysAfter },
+            'Slimmed Messages request before routing',
+          )
+        }
+        inboundLogger.info({
+          event: 'inbox.request_decoded',
+          protocol: 'messages',
           stream: anthropicReq.stream,
           thinking: anthropicReq.thinking,
           messageCount: Array.isArray(anthropicReq.messages) ? anthropicReq.messages.length : 0,
           toolCount: Array.isArray(anthropicReq.tools) ? anthropicReq.tools.length : 0,
-          body,
-        })
+        }, 'Decoded Messages inbox request')
 
         const provider = await selectWireProvider({
           model: anthropicReq.model,
@@ -148,22 +170,23 @@ Bun.serve({
         // 之前剥就分不出 local-claude-opus-5 和 ccr-claude-opus-5 了。
         anthropicReq.model = upstreamModelId(anthropicReq.model)
         if (!provider) {
-          devlog(trace, 'error', { at: 'pickProvider', model: anthropicReq.model })
+          inboundLogger.warn({ event: 'outbox.selection_failed' }, 'No outbox matched requested model')
           return new Response(JSON.stringify({ error: `No provider found for model: ${anthropicReq.model}` }), {
             status: 400,
             headers: { 'Content-Type': 'application/json' },
           })
         }
-        const wireAdapter = createWireAdapter(provider)
+        const wireAdapter = createWireAdapter(provider, inboundLogger)
         const response = await wireAdapter('https://api.anthropic.com/v1/messages', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-dev-trace': trace },
           body: JSON.stringify(anthropicReq),
         })
 
-        return adapter.encodeResponse(response, body, trace)
-      } catch (err: any) {
-        return new Response(JSON.stringify({ error: err.message }), {
+        return adapter.encodeResponse(response, body, trace, { logger: inboundLogger })
+      } catch (error: any) {
+        requestLogger.error({ event: 'inbox.request_failed', error }, 'Messages inbox request failed')
+        return new Response(JSON.stringify({ error: error.message }), {
           status: 500,
           headers: { 'Content-Type': 'application/json' },
         })
@@ -172,34 +195,43 @@ Bun.serve({
 
     // 3. Codex Responses API (codex-g, wire_api="responses")
     if (url.pathname === '/v1/responses' && req.method === 'POST') {
-      const trace = newTrace()
+      const trace = requestTrace
       try {
-        const responsesReq = await req.json()
+        const responsesReq: any = await req.json()
         const cid = identifyClient(req, 'responses', responsesReq)
-        setTraceMeta(trace, { harness: cid.harness, model: responsesReq.model, session: cid.session, ua: cid.ua })
-        devlog(trace, 'inbound', {
-          protocol: 'responses',
-          path: url.pathname,
+        const inboundLogger = createGatewayRequestLogger(requestLogger, trace, {
+          harness: cid.harness,
           model: responsesReq.model,
+          session: cid.session,
+        })
+        inboundLogger.info({
+          event: 'inbox.request_decoded',
+          protocol: 'responses',
           reasoning: responsesReq.reasoning,
           inputCount: Array.isArray(responsesReq.input) ? responsesReq.input.length : 0,
           toolCount: Array.isArray(responsesReq.tools) ? responsesReq.tools.length : 0,
-          body: responsesReq,
-        })
+        }, 'Decoded Responses inbox request')
 
         const adapter = pickIngressAdapter('responses')
         const { request: anthropicReq, namespaceTools, droppedNamespaces, losses } =
           decodeResponsesToAnthropic(responsesReq)
 
         if (droppedNamespaces.length > 0) {
-          devlog(trace, 'tools_capped', { kept: namespaceTools.size, dropped: droppedNamespaces })
+          inboundLogger.warn(
+            { event: 'inbox.tool_namespaces_capped', kept: namespaceTools.size, dropped: droppedNamespaces },
+            'Responses inbox exceeded the outbox tool budget',
+          )
         }
-        // 入站解码的有损翻译逐条落盘（工具预算、builtin 工具、无法重放的 reasoning 历史…）。
-        devlogLosses(trace, losses)
+        logGatewayIRLosses(inboundLogger, losses)
 
         anthropicReq.model = resolveModel(anthropicReq.model, latestUserInput(responsesReq)).model
         const slimR = slimAnthropicRequest(anthropicReq)
-        if (slimR.on) console.log(`[slim] responses: tools ${slimR.toolsBefore}→${slimR.toolsAfter}, system ${slimR.sysBefore}→${slimR.sysAfter} chars`)
+        if (slimR.on) {
+          inboundLogger.debug(
+            { event: 'inbox.request_slimmed', toolsBefore: slimR.toolsBefore, toolsAfter: slimR.toolsAfter, systemBefore: slimR.sysBefore, systemAfter: slimR.sysAfter },
+            'Slimmed Responses request before routing',
+          )
+        }
         const provider = await selectWireProvider({
           model: anthropicReq.model,
           customTokens,
@@ -210,14 +242,14 @@ Bun.serve({
         // 之前剥就分不出 local-claude-opus-5 和 ccr-claude-opus-5 了。
         anthropicReq.model = upstreamModelId(anthropicReq.model)
         if (!provider) {
-          devlog(trace, 'error', { at: 'pickProvider', model: anthropicReq.model })
+          inboundLogger.warn({ event: 'outbox.selection_failed' }, 'No outbox matched requested model')
           return new Response(
             JSON.stringify({ error: `No provider found for model: ${anthropicReq.model}` }),
             { status: 400, headers: { 'Content-Type': 'application/json' } },
           )
         }
 
-        const wireAdapter = createWireAdapter(provider)
+        const wireAdapter = createWireAdapter(provider, inboundLogger)
         const anthropicResponse = await wireAdapter('https://api.anthropic.com/v1/messages', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-dev-trace': trace },
@@ -226,9 +258,10 @@ Bun.serve({
 
         if (!anthropicResponse.ok) return anthropicResponse
 
-        return adapter.encodeResponse(anthropicResponse, responsesReq, trace, { namespaceTools })
-      } catch (err: any) {
-        return new Response(JSON.stringify({ error: err.message }), {
+        return adapter.encodeResponse(anthropicResponse, responsesReq, trace, { namespaceTools, logger: inboundLogger })
+      } catch (error: any) {
+        requestLogger.error({ event: 'inbox.request_failed', error }, 'Responses inbox request failed')
+        return new Response(JSON.stringify({ error: error.message }), {
           status: 500,
           headers: { 'Content-Type': 'application/json' },
         })
@@ -237,26 +270,34 @@ Bun.serve({
 
     // 4. OpenAI Chat Completions (openai-compat clients)
     if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
-      const trace = newTrace()
+      const trace = requestTrace
       try {
-        const openaiReq = await req.json()
+        const openaiReq: any = await req.json()
         const cid = identifyClient(req, 'chat', openaiReq)
-        setTraceMeta(trace, { harness: cid.harness, model: openaiReq.model, session: cid.session, ua: cid.ua })
-        devlog(trace, 'inbound', {
-          protocol: 'chat',
-          path: url.pathname,
+        const inboundLogger = createGatewayRequestLogger(requestLogger, trace, {
+          harness: cid.harness,
           model: openaiReq.model,
+          session: cid.session,
+        })
+        inboundLogger.info({
+          event: 'inbox.request_decoded',
+          protocol: 'chat',
           stream: openaiReq.stream,
           messageCount: Array.isArray(openaiReq.messages) ? openaiReq.messages.length : 0,
-          body: openaiReq,
-        })
+          toolCount: Array.isArray(openaiReq.tools) ? openaiReq.tools.length : 0,
+        }, 'Decoded Chat Completions inbox request')
 
         const adapter = pickIngressAdapter('chat')
         const anthropicReq = adapter.decodeRequest(openaiReq)
         anthropicReq.model = resolveModel(anthropicReq.model, latestUserInput(openaiReq)).model
 
         const slimC = slimAnthropicRequest(anthropicReq)
-        if (slimC.on) console.log(`[slim] chat: tools ${slimC.toolsBefore}→${slimC.toolsAfter}, system ${slimC.sysBefore}→${slimC.sysAfter} chars`)
+        if (slimC.on) {
+          inboundLogger.debug(
+            { event: 'inbox.request_slimmed', toolsBefore: slimC.toolsBefore, toolsAfter: slimC.toolsAfter, systemBefore: slimC.sysBefore, systemAfter: slimC.sysAfter },
+            'Slimmed Chat Completions request before routing',
+          )
+        }
 
         const provider = await selectWireProvider({
           model: anthropicReq.model,
@@ -268,14 +309,14 @@ Bun.serve({
         // 之前剥就分不出 local-claude-opus-5 和 ccr-claude-opus-5 了。
         anthropicReq.model = upstreamModelId(anthropicReq.model)
         if (!provider) {
-          devlog(trace, 'error', { at: 'pickProvider', model: anthropicReq.model })
+          inboundLogger.warn({ event: 'outbox.selection_failed' }, 'No outbox matched requested model')
           return new Response(JSON.stringify({ error: `No provider found for model: ${anthropicReq.model}` }), {
             status: 400,
             headers: { 'Content-Type': 'application/json' },
           })
         }
 
-        const wireAdapter = createWireAdapter(provider)
+        const wireAdapter = createWireAdapter(provider, inboundLogger)
         const anthropicResponse = await wireAdapter('https://api.anthropic.com/v1/messages', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-dev-trace': trace },
@@ -284,15 +325,17 @@ Bun.serve({
 
         if (!anthropicResponse.ok) return anthropicResponse
 
-        return adapter.encodeResponse(anthropicResponse, openaiReq, trace)
-      } catch (err: any) {
-        return new Response(JSON.stringify({ error: err.message }), {
+        return adapter.encodeResponse(anthropicResponse, openaiReq, trace, { logger: inboundLogger })
+      } catch (error: any) {
+        requestLogger.error({ event: 'inbox.request_failed', error }, 'Chat Completions inbox request failed')
+        return new Response(JSON.stringify({ error: error.message }), {
           status: 500,
           headers: { 'Content-Type': 'application/json' },
         })
       }
     }
 
+    requestLogger.warn({ event: 'inbox.route_not_found' }, 'Gateway route was not found')
     return new Response(JSON.stringify({ error: 'Not found' }), {
       status: 404,
       headers: { 'Content-Type': 'application/json' },

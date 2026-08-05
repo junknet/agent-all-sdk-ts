@@ -151,7 +151,7 @@ export function resolveDefaultMaxTokens(): number {
  * `thinking.enabled.budget_tokens: Input should be greater than or equal to
  * 1024` (verified across opus-5 / sonnet-5 / fable-5 / opus-4-8). The tier is
  * real and worth keeping — cc-relay accepts it, because it encodes the tier in
- * the model name instead of a budget — so the fix is to clamp at the egress
+ * the model name instead of a budget — so the fix is to clamp at the outbox
  * that has the floor, not to stop advertising the tier.
  */
 const ANTHROPIC_MIN_THINKING_BUDGET = 1024

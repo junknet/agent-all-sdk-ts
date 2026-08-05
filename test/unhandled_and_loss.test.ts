@@ -450,7 +450,7 @@ describe('IRLoss: 三处已确认的静默丢失都要留痕', () => {
 
     expect(prepared.losses).toHaveLength(1)
     expect(prepared.losses![0]).toMatchObject({
-      stage: 'egress',
+      stage: 'outbox',
       provider: 'codex',
       path: '$.max_tokens',
       kind: 'dropped',
@@ -491,7 +491,7 @@ describe('IRLoss: 三处已确认的静默丢失都要留痕', () => {
       '$.tools[type=image_generation]',
     ])
     for (const loss of builtinLosses) {
-      expect(loss.stage).toBe('ingress')
+      expect(loss.stage).toBe('inbox')
       expect(loss.kind).toBe('dropped')
       expect(loss.provider).toBeNull()
     }
@@ -522,7 +522,7 @@ describe('IRLoss: 三处已确认的静默丢失都要留痕', () => {
     const budgetLosses = losses.filter(l => l.path.startsWith('$.tools[namespace='))
     expect(budgetLosses).toHaveLength(1)
     expect(budgetLosses[0]).toMatchObject({
-      stage: 'ingress',
+      stage: 'inbox',
       provider: null,
       path: '$.tools[namespace=codex_apps_github]',
       kind: 'dropped',
@@ -555,40 +555,4 @@ describe('IRLoss: 三处已确认的静默丢失都要留痕', () => {
 
     expect(losses).toEqual([])
   })
-})
-
-// ── loss 真的落盘 ───────────────────────────────────────────────────
-
-test('devlogLosses 把每条 loss 单独写成一行 NDJSON，不折叠成计数', async () => {
-  // devlog.ts 在模块加载时读 AGENT_GATEWAY_LOG_DIR，所以必须在独立进程里验，
-  // 否则会污染真实的网关流量日志目录。
-  const dir = `/tmp/agent-sdk-loss-test-${Date.now()}`
-  const script = `
-    const { devlogLosses } = await import('${import.meta.dir}/../src/devlog.ts')
-    devlogLosses('tr_test', [
-      { stage: 'egress', provider: 'codex', path: '$.max_tokens', kind: 'dropped', detail: 'no equivalent' },
-      { stage: 'ingress', provider: null, path: '$.tools[type=web_search]', kind: 'dropped', detail: 'builtin' },
-    ])
-  `
-  const proc = Bun.spawn(['bun', '-e', script], {
-    env: { ...process.env, AGENT_GATEWAY_LOG_DIR: dir, AGENT_GATEWAY_DEVLOG: '1' },
-    stdout: 'pipe',
-    stderr: 'pipe',
-  })
-  await proc.exited
-  expect(proc.exitCode).toBe(0)
-
-  const { readdirSync, readFileSync, rmSync } = await import('node:fs')
-  const files = readdirSync(dir)
-  expect(files).toHaveLength(1)
-  const lines: string[] = readFileSync(`${dir}/${files[0]}`, 'utf8').trim().split('\n')
-
-  // 两条 loss = 两行，一条一条可见。
-  expect(lines).toHaveLength(2)
-  const records: Array<Record<string, unknown>> = lines.map(line => JSON.parse(line))
-  expect(records.every(r => r.phase === 'ir_loss' && r.trace === 'tr_test')).toBe(true)
-  expect(records[0]).toMatchObject({ stage: 'egress', provider: 'codex', path: '$.max_tokens', kind: 'dropped' })
-  expect(records[1]).toMatchObject({ stage: 'ingress', provider: null, path: '$.tools[type=web_search]' })
-
-  rmSync(dir, { recursive: true, force: true })
 })

@@ -16,7 +16,7 @@ cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
 
 # Bun loads repository-local .env files into test processes, so gateway credentials
 # live outside the worktree. Load the owner-only runtime file explicitly so every
-# restart uses the selected egress rather than an inherited shell's provider settings.
+# restart uses the selected outbox rather than an inherited shell's provider settings.
 ENV_FILE="${AGENT_GATEWAY_ENV_FILE:-$HOME/.config/agent-all-sdk-ts/cc-relay.env}"
 if [[ -f "$ENV_FILE" ]]; then
   [[ "$(stat -c '%a' -- "$ENV_FILE")" == "600" ]] || {

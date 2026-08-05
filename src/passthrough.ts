@@ -4,7 +4,7 @@
 
 import type { AnthropicMessagesRequest } from './types.js'
 
-export function shouldPassthrough(input: RequestInfo | URL): boolean {
+export function shouldPassthrough(input: Request | URL | string): boolean {
   const url = input instanceof Request ? input.url : String(input)
   return !url.includes('/v1/messages')
 }
@@ -29,11 +29,5 @@ export async function extractRequestBody(
     return JSON.parse(text) as AnthropicMessagesRequest
   } catch {
     return { messages: [] }
-  }
-}
-
-export function debugLog(label: string, payload: unknown): void {
-  if (process.env.DEBUG_WIRE) {
-    console.error(`[wire:${label}]`, typeof payload === 'string' ? payload : JSON.stringify(payload))
   }
 }

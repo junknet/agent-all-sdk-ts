@@ -28,7 +28,7 @@ import type {
   IRLoss,
 } from './types.js'
 import { iterSSE, formatSSE, tryParseJSON } from './sse.js'
-import { devlog } from './devlog.js'
+import type { GatewayLogger } from './logging.js'
 import { parseReasoningEffort } from './thinking.js'
 import { parseServiceTier } from './service_tier.js'
 import { normalizeToolTurns, resolveDefaultMaxTokens } from './anthropic_constraints.js'
@@ -115,7 +115,7 @@ function decodeTools(
       // backend cannot execute them. codex falls back to function tools for file work.
       // 丢是唯一选项，无声丢不是：客户端声明了工具，模型侧根本看不到这个符号。
       losses.push({
-        stage: 'ingress',
+        stage: 'inbox',
         provider: null,
         path: `$.tools[type=${t.type}]`,
         kind: 'dropped',
@@ -134,7 +134,7 @@ function decodeTools(
       // 内部同时记一条 IRLoss，让它和另外两处走同一套留痕。
       droppedNamespaces.push(`${g.namespace}(${g.members.length})`)
       losses.push({
-        stage: 'ingress',
+        stage: 'inbox',
         provider: null,
         path: `$.tools[namespace=${g.namespace}]`,
         kind: 'dropped',
@@ -274,7 +274,7 @@ export function decodeResponsesToAnthropic(req: any): {
         // server-managed reasoning history (encrypted_content) — not replayable to the
         // Gemini backend; drop. The next user/tool turn carries the actual context.
         losses.push({
-          stage: 'ingress',
+          stage: 'inbox',
           provider: null,
           path: '$.input[type=reasoning]',
           kind: 'dropped',
@@ -287,7 +287,7 @@ export function decodeResponsesToAnthropic(req: any): {
         // 上游(或某个新版 codex)加了个我们不认识的 input item 类型。此前直接 break 掉，
         // 整段历史凭空消失且无处可查。
         losses.push({
-          stage: 'ingress',
+          stage: 'inbox',
           provider: null,
           path: `$.input[type=${String(item.type)}]`,
           kind: 'dropped',
@@ -377,6 +377,7 @@ export function encodeAnthropicToResponsesSSE(
   model: string,
   trace?: string,
   namespaceTools?: NamespaceToolMap,
+  logger?: GatewayLogger,
 ): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder()
   const responseId = genId('resp')
@@ -395,7 +396,7 @@ export function encodeAnthropicToResponsesSSE(
   return new ReadableStream<Uint8Array>({
     async start(controller) {
       const send = (event: string, data: unknown): void => {
-        if (trace) devlog(trace, 'outbound_responses', { event, data })
+        logger?.trace({ event: 'inbox.responses_sse_event', responseEvent: event }, 'Encoded Responses SSE event')
         controller.enqueue(encoder.encode(formatSSE(event, data)))
       }
       const responseEnvelope = (status: string): Record<string, unknown> => ({

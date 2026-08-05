@@ -12,7 +12,7 @@ import { createCodexProvider } from '../src/providers/codex_provider.js'
 // exhausting its own retry cap, surfacing only a generic "Assistant returned empty stop
 // after retry cap" with zero indication of the real cause.
 //
-// Verified live: grep-ing one day of gateway devlog traffic
+// Verified live from one day of gateway traffic observations.
 // (<traffic-logs>/gateway-dev-20260801.ndjson) found 126
 // occurrences of context_length_exceeded, every one of them silently swallowed.
 

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { ChatIngressAdapter } from '../src/ingress.js'
+import { ChatIngressAdapter } from '../src/inbox.js'
 import { encodeAnthropicToResponsesSSE } from '../src/responses_api.js'
 import { AnthropicEventEmitter } from '../src/emitter.js'
 import {

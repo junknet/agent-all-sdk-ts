@@ -11,6 +11,8 @@
     "@types/node": "^25.9.2"
   },
   "dependencies": {
-    "agent-ir": "file:../agent-ir"
+    "agent-ir": "file:../agent-ir",
+    "pino": "^10.3.1",
+    "pino-pretty": "^13.1.3"
   }
 }

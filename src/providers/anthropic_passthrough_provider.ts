@@ -146,7 +146,7 @@ export function createAnthropicPassthroughProvider(
         ...requestWithoutGatewayFields
       } = req
       // Direct provider callers may still hand us an Anthropic wire object. The
-      // ingress path always supplies `reasoning`; this fallback keeps the public
+      // inbox path always supplies `reasoning`; this fallback keeps the public
       // provider factory backwards compatible without leaking the legacy field.
       const thinking = toAnthropicThinking(reasoning ?? parseAnthropicThinking(legacyThinking))
       const serviceTier =

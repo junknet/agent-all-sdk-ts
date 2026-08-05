@@ -31,6 +31,9 @@ channels:
   local:
     description: 本机凭证直连 (antigravity OAuth / codex OAuth / anthropic OAuth)
     note: 不经任何第三方转售，配额来自本机登录的订阅。
+  windsurf:
+    description: 本机 Devin/Windsurf 登录的 Codeium Connect/protobuf Outbox
+    note: 仅在本机凭据可读取时发布；请求由 agent-ir 负责编译与解析。
   ccr:
     description: cc-relay.tikteken.com 转售出口
     requires_env: CC_RELAY_PROTOCOL_AWARE
@@ -91,6 +94,22 @@ _templates:
       efforts: [minimal, low, medium, high, xhigh, max]
       default: high
       canDisable: true
+    verified: true
+
+  # Windsurf 的真实三轮 agent gate 仅验证了文本、多轮工具循环与图片工具结果。
+  # 其 Claude Medium 实际模型标识由 `windsurf-` 出口前缀剥离后写入 Connect。
+  # `GetCliModelConfigs` 实测该 uid: maxTokens=1M / maxOutputTokens=128k，
+  # 且支持图片、工具与思考。uid 自己编码 medium 档位，wire 没有开关可将其改档。
+  windsurf: &windsurf
+    channel: windsurf
+    images: true
+    tools: true
+    contextWindow: 1000000
+    maxOutputTokens: 128000
+    thinking:
+      efforts: [medium]
+      default: medium
+      canDisable: false
     verified: true
 
   # 两个平台的 GET /models 都只回 {id}，不含任何限额字段(2026-08-04 实测
@@ -194,6 +213,11 @@ models:
   - id: local-claude-opus-4-8
     <<: *claude
     upstream: claude-opus-4-8
+
+  # ── windsurf: Devin/Windsurf 本机登录 ────────────────────────────────
+  - id: windsurf-claude-sonnet-5-medium
+    <<: *windsurf
+    upstream: claude-sonnet-5-medium
 
   # ── official: DeepSeek 官方 ───────────────────────────────────────────
   # 官方 API 把当前 Flash 权重就叫 deepseek-v4-flash;
