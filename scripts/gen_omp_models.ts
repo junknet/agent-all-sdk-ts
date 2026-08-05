@@ -1,11 +1,12 @@
 #!/usr/bin/env bun
 /**
- * Generate OMP's `models.yml` from this gateway's model registry.
+ * Generate OMP's `models.yml` from this gateway's live public catalog.
  *
  * Why generated rather than hand-written: OMP needs per-model capability
  * metadata that its own discovery cannot obtain, so the same facts would
- * otherwise be maintained in two files and drift. The registry is the source;
- * this projects it.
+ * otherwise be maintained in two files and drift. `model_registry.yaml` owns
+ * capability facts, while GET /v1/models decides which of those facts are
+ * actually usable by the currently logged-in gateway.
  *
  * What OMP's proxy discovery does and does not read from GET /v1/models:
  *   reads  — id, supported_endpoint_types, context_length
@@ -85,8 +86,33 @@ function render(entries: readonly RegistryEntry[]): string {
   return out.join('\n') + '\n'
 }
 
+interface GatewayModelCatalogResponse {
+  readonly object: 'list'
+  readonly data: readonly { readonly id: string }[]
+}
+
+/** Refuse to write a client config from candidates that the running gateway did not publish. */
+async function loadLiveGatewayModelIds(baseUrl: string): Promise<ReadonlySet<string>> {
+  const catalogUrl = new URL('models', `${baseUrl.replace(/\/$/, '')}/`).toString()
+  const response = await fetch(catalogUrl)
+  if (!response.ok) {
+    throw new Error(`Cannot generate OMP models: GET ${catalogUrl} returned HTTP ${response.status}`)
+  }
+  const catalog = await response.json() as GatewayModelCatalogResponse
+  if (catalog.object !== 'list' || !Array.isArray(catalog.data)) {
+    throw new Error(`Cannot generate OMP models: GET ${catalogUrl} did not return a models list`)
+  }
+  const ids = new Set(catalog.data.map(model => model?.id).filter((id): id is string => typeof id === 'string'))
+  if (ids.size === 0) throw new Error(`Cannot generate OMP models: GET ${catalogUrl} published no models`)
+  return ids
+}
+
 const target =
   process.argv[2] ?? path.join(os.homedir(), '.omp', 'agent', 'models.yml')
-const entries = listRegistry()
+const liveModelIds = await loadLiveGatewayModelIds(GATEWAY_BASE_URL)
+const entries = listRegistry().filter(entry => liveModelIds.has(entry.id))
+if (entries.length === 0) {
+  throw new Error('Cannot generate OMP models: no live gateway model has a registry capability declaration')
+}
 await Bun.write(target, render(entries))
-console.log(`wrote ${entries.length} model overrides to ${target}`)
+console.log(`wrote ${entries.length} live model overrides to ${target}`)
