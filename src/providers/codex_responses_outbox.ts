@@ -61,7 +61,8 @@ export function createCodexResponsesOutboxProvider(options: CodexResponsesOutbox
 
     async buildRequest(request: AnthropicMessagesRequest): Promise<WirePreparedRequest> {
       const model = options.model ?? mapClaudeModelToCodex(request.model ?? null)
-      const attestationHeader = await generateCodexAttestationHeader()
+      const timeoutMs = process.env.NODE_ENV === 'test' || process.env.BUN_TEST ? 1200 : 8000
+      const attestationHeader = await generateCodexAttestationHeader(timeoutMs)
 
       const outbox = createCodexWebSocketResponseOutbox({
         model,
@@ -117,7 +118,14 @@ export function createCodexResponsesOutboxProvider(options: CodexResponsesOutbox
     },
 
     async listModels(): Promise<ModelInfo[]> {
-      return CODEX_MODELS.map(model => ({ id: model.id, name: model.label }))
+      return CODEX_MODELS.map(model => ({
+        id: model.id,
+        name: model.label,
+        contextWindow: 1048576,
+        maxOutputTokens: 1048576,
+        supportsTools: true,
+        supportsImages: true,
+      }))
     },
 
     async getQuota(): Promise<QuotaInfo> {
