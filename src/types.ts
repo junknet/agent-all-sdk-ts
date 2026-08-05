@@ -1,4 +1,5 @@
 import type { AnthropicEventEmitter } from './emitter.js'
+import type { IREvent, IRResponse, SseEvent } from 'agent-ir'
 
 export type WireProviderName = 'antigravity' | 'openai-compat' | 'codex' | 'anthropic-passthrough' | 'windsurf'
 
@@ -122,8 +123,8 @@ export interface AnthropicMessagesRequest {
  * 它只写日志，不改出站字节流 —— 有损是既成事实，记下来是为了可诊断，不是为了改行为。
  */
 export interface IRLoss {
-  /** inbox = 入站解码丢的；outbox = 出站 buildRequest 丢的；lift = 上游响应回抬时丢的。 */
-  readonly stage: 'inbox' | 'outbox' | 'lift'
+  /** inbox = 入站解码丢的；outbox = 出站 buildRequest 丢的；outboxResponse = 上游响应读取时丢的。 */
+  readonly stage: 'inbox' | 'outbox' | 'outboxResponse'
   /** 丢在哪个出口上；入站阶段还没选出口时为 null。 */
   readonly provider: string | null
   /** 丢的是哪个字段，用 IR 路径表示，如 '$.max_tokens'。 */
@@ -143,13 +144,37 @@ export interface WirePreparedRequest {
    * provider 自己没有 trace，把 loss 带出去比在 provider 里硬凑一个日志上下文干净。
    */
   losses?: IRLoss[]
+  /**
+   * 由 agent-ir 把 Outbox 响应直接写回 Anthropic Inbox 的单轨出口。存在时不得再走
+   * AnthropicEventEmitter 的旧缓冲链路。
+   */
+  writeAnthropicInboxResponse?: (
+    response: Response,
+    observation?: AgentIrResponseObservation,
+  ) => Response | Promise<Response>
+  /**
+   * 非 HTTP 上游直接交出完整客户端响应；仅用于已由 agent-ir 读取成 IR 事件的流式传输。
+   */
+  createAnthropicInboxResponse?: (
+    observation?: AgentIrResponseObservation,
+  ) => Response | Promise<Response>
+}
+
+/**
+ * agent-ir 单轨回写的三个洋葱观察点。它们都是旁路：实现方不得让日志失败中断客户端流。
+ * 每个点只接触一种已经确定的协议层对象，避免在应用层重写任何 SSE 状态机。
+ */
+export interface AgentIrResponseObservation {
+  readonly inspectOutboxSseFrame?: (frame: SseEvent) => void | Promise<void>
+  readonly observeGuardedIREvent?: (event: IREvent) => void | Promise<void>
+  readonly observeCompletedResponse?: (response: IRResponse) => void | Promise<void>
 }
 
 export interface WireProvider {
   readonly name: WireProviderName
   prepare?(): Promise<void>
   buildRequest(req: AnthropicMessagesRequest): Promise<WirePreparedRequest>
-  parseStream(response: Response, emitter: AnthropicEventEmitter): Promise<void>
+  parseStream?(response: Response, emitter: AnthropicEventEmitter): Promise<void>
   listModels?(): Promise<ModelInfo[]>
   getQuota?(): Promise<QuotaInfo>
 }

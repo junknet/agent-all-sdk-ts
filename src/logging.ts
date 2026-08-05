@@ -9,7 +9,7 @@
 
 import pino, { type DestinationStream, type Logger as PinoLogger } from 'pino'
 import pinoPretty from 'pino-pretty'
-import type { IRLoss } from './types.js'
+import type { AgentIrResponseObservation, IRLoss } from './types.js'
 
 export const GATEWAY_LOG_LEVELS = ['trace', 'debug', 'info', 'warn', 'error'] as const
 export type GatewayLogLevel = (typeof GATEWAY_LOG_LEVELS)[number]
@@ -123,6 +123,106 @@ export function redactGatewayHeaders(
   return Object.fromEntries(
     entries.map(([name, value]) => [name, SENSITIVE_HEADER.test(name) ? `[REDACTED:${String(value).length}]` : String(value)]),
   )
+}
+
+/**
+ * Extract only scheduling evidence from a JSON outbox body.  This deliberately
+ * avoids logging messages, tools, or credentials: the audit record answers
+ * whether a serving-tier directive was sent without retaining user payloads.
+ */
+export function summarizeOutboxScheduling(body: string | Uint8Array): Readonly<Record<string, unknown>> | undefined {
+  try {
+    const text = typeof body === 'string' ? body : new TextDecoder().decode(body)
+    const value: unknown = JSON.parse(text)
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+    const request = value as Record<string, unknown>
+    return {
+      model: request.model,
+      serviceTier: request.service_tier,
+      stream: request.stream,
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/** Extract the scheduling acknowledgement from a raw Responses SSE event. */
+export function summarizeResponsesSchedulingEvent(data: string): Readonly<Record<string, unknown>> | undefined {
+  try {
+    const event: unknown = JSON.parse(data)
+    if (!event || typeof event !== 'object' || Array.isArray(event)) return undefined
+    const record = event as Record<string, unknown>
+    if (record.type !== 'response.created') return undefined
+    const response = record.response
+    if (!response || typeof response !== 'object' || Array.isArray(response)) return undefined
+    const created = response as Record<string, unknown>
+    return {
+      model: created.model,
+      serviceTier: created.service_tier,
+      status: created.status,
+    }
+  } catch {
+    return undefined
+  }
+}
+
+function summarizeGuardedIREvent(event: Parameters<NonNullable<AgentIrResponseObservation['observeGuardedIREvent']>>[0]): Record<string, unknown> {
+  switch (event.kind) {
+    case 'messageStart': return { kind: event.kind, model: event.model }
+    case 'partStart': return { kind: event.kind, index: event.index, partKind: event.part.kind }
+    case 'partDelta': {
+      switch (event.delta.kind) {
+        case 'toolInputJson': return { kind: event.kind, index: event.index, deltaKind: event.delta.kind, valueBytes: event.delta.json.length }
+        case 'thinkingSignature': return { kind: event.kind, index: event.index, deltaKind: event.delta.kind, valueBytes: event.delta.signature.length }
+        case 'text':
+        case 'thinking':
+        case 'toolInputText': return { kind: event.kind, index: event.index, deltaKind: event.delta.kind, valueBytes: event.delta.text.length }
+      }
+    }
+    case 'partEnd': return { kind: event.kind, index: event.index }
+    case 'usage': return { kind: event.kind, usage: event.usage }
+    case 'messageStop': return { kind: event.kind, reason: event.reason }
+    case 'error': return { kind: event.kind, error: { kind: event.error.kind, httpStatus: event.error.httpStatus, retryable: event.error.retryable, message: event.error.message } }
+    case 'loss': return { kind: event.kind, loss: event.loss }
+    case 'unhandled': return { kind: event.kind, rawType: event.rawType }
+    case 'committed':
+    case 'heartbeat': return { kind: event.kind }
+  }
+}
+
+/**
+ * Pino 仅作为宿主注入的旁路 sink：它不解析、不缓冲，也不改变 agent-ir 的流。
+ * 原始 SSE 只抽取 Responses 的服务档位回显；IR delta 仅记录种类与长度，loss 全量保留。
+ */
+export function createAgentIrResponseObservation(logger: GatewayLogger): AgentIrResponseObservation {
+  return {
+    inspectOutboxSseFrame: (frame) => {
+      const scheduling = summarizeResponsesSchedulingEvent(frame.data)
+      if (scheduling) {
+        logger.debug(
+          { event: 'agent_ir.outbox_sse_scheduling', scheduling },
+          'Observed Responses scheduling acknowledgement',
+        )
+      }
+    },
+    observeGuardedIREvent: (event) => {
+      const audit = summarizeGuardedIREvent(event)
+      const level = event.kind === 'loss' || event.kind === 'error' || event.kind === 'unhandled' ? 'warn' : 'debug'
+      logger[level]({ event: 'agent_ir.guarded_event', ir: audit }, 'Observed agent-ir guarded event')
+    },
+    observeCompletedResponse: (response) => {
+      logger.debug({
+        event: 'agent_ir.inbox_response_completed',
+        response: {
+          model: response.model,
+          stopReason: response.stopReason,
+          parts: response.turn.parts.map(part => part.kind),
+          usage: response.usage,
+          error: response.error === null ? null : { kind: response.error.kind, httpStatus: response.error.httpStatus },
+        },
+      }, 'Observed complete agent-ir response')
+    },
+  }
 }
 
 /** Every lossy IR conversion is a warning because it changes the caller's intent. */

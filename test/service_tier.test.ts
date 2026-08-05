@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { ChatIngressAdapter, MessagesIngressAdapter } from '../src/inbox.js'
 import { createAnthropicPassthroughProvider } from '../src/providers/anthropic_passthrough_provider.js'
 import { createAntigravityProvider } from '../src/providers/antigravity_provider.js'
-import { createCodexProvider } from '../src/providers/codex_provider.js'
+import { createCodexResponsesOutboxProvider } from '../src/providers/codex_responses_outbox.js'
 import { createOpenaiCompatProvider } from '../src/providers/openai_compat_provider.js'
 import { decodeResponsesToAnthropic } from '../src/responses_api.js'
 
@@ -43,7 +43,7 @@ describe('service tier normalization', () => {
       serviceTier: priority,
       reasoning: { mode: 'effort' as const, effort: 'high' as const, source: 'client' as const },
     }
-    const codex = JSON.parse((await createCodexProvider({ accessToken: 'x.fake.token' }).buildRequest(request)).body)
+    const codex = JSON.parse((await createCodexResponsesOutboxProvider({ accessToken: 'x.fake.token' }).buildRequest(request)).body)
     const compat = JSON.parse((await createOpenaiCompatProvider({
       baseURL: 'https://example.invalid/v1', apiKey: 'key', model: 'test',
     }).buildRequest(request)).body)

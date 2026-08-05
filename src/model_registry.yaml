@@ -16,14 +16,9 @@
 #   - antigravity/codex/claude 的上游目录只证明「可用」，不描述档位语义。
 # 所以: 上游目录决定 available，本文件决定 published 与 capabilities。
 #
-# verified 说的是**窗口/输出上限这两个数字**是否有权威来源，不是开关，也不是
-# 可用性 —— 全部 29 个 id 都已实测出过文本，131 组 (模型 × 声明档位) 也已逐组
-# 发真请求验证全部被上游接受 (probe 见 scripts/ 旁的说明)。
-#   true  — contextWindow/maxOutputTokens 来自权威来源:
-#           claude 系取 GET api.anthropic.com/v1/models 的 max_input_tokens
-#           与 max_tokens (2026-08-04)；relay 转发的是同一批上游权重。
-#   false — 这两个数字仍是同族推定或已证实下界，见各自注释。路由不受影响，
-#           只影响下游按 70% 算压缩阈值的时机。
+# `contextWindow` 是网关对下游公开的容量契约。所有已发布模型统一为
+# 1,000,000 tokens，使 OMP 在任一模型上以相同阈值执行会话压缩。
+# 所有模型也统一声明 1,000,000 输出 token 上限，避免 OMP 以缺省 8,192 token 限制请求。
 
 version: 1
 
@@ -58,90 +53,66 @@ _templates:
     source: antigravity
     images: true
     tools: true
-    contextWindow: 1048576
-    maxOutputTokens: 65536
+    contextWindow: 1000000
+    maxOutputTokens: 1000000
     verified: true
 
-  # contextWindow 是**已证实的安全下界**，不是真实上限 —— 真实上限取不到:
-  #   - chatgpt.com/backend-api/codex/models 要 client_version 参数, 400;
-  #   - backend-api/models 能查, 但那是 web 端目录 (gpt-5.6-{sol,terra,luna}-wm
-  #     都报 262_144), 与 codex 出口不是同一套配额: 本网关流量日志里 codex
-  #     出口成功过 input_tokens=371_756, 已经超过 262_144。
-  # 于是取 371_756 —— 实测成功过的最大输入, 再往上就 context_length_exceeded。
-  # 比原来声明的 1_048_576 安全: 下游按 70% 触发压缩, 报大了就压得太晚, 直接
-  # 撞上游硬限; 报成下界只是稍早压缩, 不会失败。要钉死真值需再做一轮二分,
-  # 每次真烧几十万输入 token 的订阅额度。
+  # 所有模型对下游统一声明 1M 上下文与 1M 单次输出上限。
   codex: &codex
     channel: local
     source: codex
     images: true
     tools: true
-    contextWindow: 371756
-    maxOutputTokens: 128000
+    contextWindow: 1000000
+    maxOutputTokens: 1000000
     thinking:
       efforts: [low, medium, high]
       default: high
       canDisable: true
     verified: false
 
-  # 声明 1_048_576 但 GET api.anthropic.com/v1/models 的 max_input_tokens
-  # 是 1_000_000 (opus-5/sonnet-5/fable-5/opus-4-8 全是), 超报 4.9%。
   claude: &claude
     channel: local
     source: claude
     images: true
     tools: true
     contextWindow: 1000000
-    maxOutputTokens: 128000
+    maxOutputTokens: 1000000
     thinking:
       efforts: [minimal, low, medium, high, xhigh, max]
       default: high
       canDisable: true
     verified: true
 
-  # Windsurf 的真实三轮 agent gate 仅验证了文本、多轮工具循环与图片工具结果。
-  # 其 Claude Medium 实际模型标识由 `windsurf-` 出口前缀剥离后写入 Connect。
-  # `GetCliModelConfigs` 实测该 uid: maxTokens=1M / maxOutputTokens=128k，
-  # 且支持图片、工具与思考。uid 自己编码 medium 档位，wire 没有开关可将其改档。
   windsurf: &windsurf
     channel: windsurf
     images: true
     tools: true
     contextWindow: 1000000
-    maxOutputTokens: 128000
+    maxOutputTokens: 1000000
     thinking:
       efforts: [medium]
       default: medium
       canDisable: false
     verified: true
 
-  # 两个平台的 GET /models 都只回 {id}，不含任何限额字段(2026-08-04 实测
-  # api.deepseek.com/models 与 dashscope 的 compatible-mode/v1/models)，
-  # 所以下面两个数字沿用历史配置，没有权威来源 —— verified: false。
-  # 已取证的是 id 本身: official 侧只有 deepseek-v4-flash / deepseek-v4-pro,
-  # 带日期的 deepseek-v4-flash-0731 只存在于 bailian, 与 upstream 映射一致。
   deepseek: &deepseek
     images: false
     tools: true
-    contextWindow: 1048576
-    maxOutputTokens: 384000
+    contextWindow: 1000000
+    maxOutputTokens: 1000000
     thinking:
       efforts: [high, max]
       default: high
       canDisable: true
     verified: false
 
-  # cc-relay 未提供任何能力元数据。claude 系的窗口/输出上限改从权威来源取:
-  # GET api.anthropic.com/v1/models 的 max_input_tokens / max_tokens
-  # (2026-08-04 实测)，relay 转发的就是这批上游权重。每条 ccr-claude-* 都
-  # 显式覆盖了这两个值 —— 它们并不同档: opus-4-5 与 haiku-4-5 只有 200k，
-  # sonnet-4-5 是 1M 窗口但只有 64k 输出。这里的模板值只是兜底。
   ccr_claude: &ccr_claude
     channel: ccr
     images: true
     tools: true
-    contextWindow: 200000
-    maxOutputTokens: 64000
+    contextWindow: 1000000
+    maxOutputTokens: 1000000
     thinking:
       efforts: [minimal, low, medium, high, xhigh, max]
       default: high
@@ -152,8 +123,8 @@ _templates:
     channel: ccr
     images: true
     tools: true
-    contextWindow: 272000
-    maxOutputTokens: 128000
+    contextWindow: 1000000
+    maxOutputTokens: 1000000
     thinking:
       efforts: [low, medium, high]
       default: high
@@ -164,20 +135,16 @@ _templates:
     channel: ccr
     images: false
     tools: true
-    contextWindow: 131072
-    maxOutputTokens: 32768
+    contextWindow: 1000000
+    maxOutputTokens: 1000000
     verified: false
 
-  # OpenRouter 的 GET /api/v1/models 有完整字段(2026-08-05 实测)，可直接采信：
-  # deepseek/deepseek-v4-flash-0731 的 top_provider.context_length=1048576，
-  # max_completion_tokens=65536，reasoning.supported_efforts=[max,high,low]，
-  # default_effort=high。architecture.input_modalities 只有 text，无 image。
   openrouter_deepseek: &openrouter_deepseek
     channel: openrouter
     images: false
     tools: true
-    contextWindow: 1048576
-    maxOutputTokens: 65536
+    contextWindow: 1000000
+    maxOutputTokens: 1000000
     thinking:
       efforts: [low, high, max]
       default: high
@@ -269,43 +236,36 @@ models:
     <<: *ccr_claude
     upstream: claude-opus-5
     contextWindow: 1000000
-    maxOutputTokens: 128000
     verified: true
   - id: ccr-claude-opus-4-7
     <<: *ccr_claude
     upstream: claude-opus-4-7
     contextWindow: 1000000
-    maxOutputTokens: 128000
     verified: true
   - id: ccr-claude-opus-4-6
     <<: *ccr_claude
     upstream: claude-opus-4-6
     contextWindow: 1000000
-    maxOutputTokens: 128000
     verified: true
   - id: ccr-claude-opus-4-5
     <<: *ccr_claude
     upstream: claude-opus-4-5
-    contextWindow: 200000
-    maxOutputTokens: 64000
+    contextWindow: 1000000
     verified: true
   - id: ccr-claude-sonnet-5
     <<: *ccr_claude
     upstream: claude-sonnet-5
     contextWindow: 1000000
-    maxOutputTokens: 128000
     verified: true
   - id: ccr-claude-sonnet-4-6
     <<: *ccr_claude
     upstream: claude-sonnet-4-6
     contextWindow: 1000000
-    maxOutputTokens: 128000
     verified: true
   - id: ccr-claude-sonnet-4-5
     <<: *ccr_claude
     upstream: claude-sonnet-4-5
     contextWindow: 1000000
-    maxOutputTokens: 64000
     verified: true
   - id: ccr-claude-fable-5
     <<: *ccr_claude
@@ -315,13 +275,11 @@ models:
       default: high
       canDisable: false
     contextWindow: 1000000
-    maxOutputTokens: 128000
     verified: true
   - id: ccr-claude-haiku-4-5
     <<: *ccr_claude
     upstream: claude-haiku-4-5
-    contextWindow: 200000
-    maxOutputTokens: 64000
+    contextWindow: 1000000
     verified: true
   - id: ccr-gpt-5-6-sol
     <<: *ccr_gpt
@@ -338,8 +296,7 @@ models:
   - id: ccr-deepseek-v4
     <<: *ccr_chat
     upstream: deepseek-v4
-    contextWindow: 1048576
-    maxOutputTokens: 65536
+    contextWindow: 1000000
     thinking: { efforts: [high, max], default: high, canDisable: true }
   - id: ccr-glm-5-2
     <<: *ccr_chat

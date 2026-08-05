@@ -4,7 +4,7 @@ import {
   createAntigravityProvider,
   ANTIGRAVITY_DEFAULT_MODEL,
 } from './providers/antigravity_provider.js'
-import { createCodexProvider } from './providers/codex_provider.js'
+import { CODEX_MODELS } from './providers/codex_models.js'
 import { createOpenaiCompatProvider } from './providers/openai_compat_provider.js'
 import { windsurfCredentialsAreAvailable } from './providers/windsurf_agent_ir_provider.js'
 import type { ModelInfo, ThinkingEffort } from './types.js'
@@ -275,12 +275,9 @@ export async function listAvailableModels(): Promise<ModelInfo[]> {
       await provider.prepare?.()
       return (await provider.listModels?.()) ?? []
     }),
-    isolateCatalog('codex', async () => {
-      if (codexCredit?.type !== 'oauth' || !codexCredit.source) return []
-      const provider = createCodexProvider({ source: codexCredit.source })
-      await provider.prepare?.()
-      return (await provider.listModels?.()) ?? []
-    }),
+    isolateCatalog('codex', async () => codexCredit?.type === 'oauth' && codexCredit.source
+      ? CODEX_MODELS.map(model => ({ id: model.id, name: model.label }))
+      : []),
     isolateCatalog('claude', async () => {
       if (!claudeCredit) return []
       const provider = createAnthropicPassthroughProvider({

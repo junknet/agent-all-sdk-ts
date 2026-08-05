@@ -8,15 +8,18 @@ import {
   createGatewayLogger,
   createGatewayRequestLogger,
   createGatewayTraceId,
+  createAgentIrResponseObservation,
   logGatewayIRLosses,
   redactGatewayHeaders,
+  summarizeOutboxScheduling,
   teeGatewaySseResponseForTraceLogging,
   type GatewayLogger,
 } from './logging.js'
 import { compressImages } from './image_compress.js'
 import type { WireProvider } from './types.js'
 import { createOpenaiCompatProvider } from './providers/openai_compat_provider.js'
-import { createCodexProvider } from './providers/codex_provider.js'
+import { createCodexResponsesOutboxProvider } from './providers/codex_responses_outbox.js'
+import { createOpenAIResponsesOutboxProvider } from './providers/openai_responses_outbox.js'
 import { createAntigravityProvider, ANTIGRAVITY_DEFAULT_MODEL } from './providers/antigravity_provider.js'
 import { createAnthropicPassthroughProvider } from './providers/anthropic_passthrough_provider.js'
 import {
@@ -75,7 +78,7 @@ export function resolveModel(
   // selected id would make its catalog-derived protocol lookup incorrect.
   if (isCcRelayProtocolAware()) return { model: model ?? '', escalated: false }
   const m = remapModel(model)
-  // 「思考」escalation lifts a LOWER flash gear to the high flash gear. It must never
+  // 「思考」escalation raises a LOWER flash gear to the high flash gear. It must never
   // touch a Pro pick — that's a bigger model, not a budget tier;
   // escalating it to a flash gear would be a DOWNGRADE.
   const isDeepSeekModel = /(?:^|\/)deepseek-/i.test(m)
@@ -115,8 +118,8 @@ export async function pickCcRelayWireProvider(opts: PickProviderOpts): Promise<W
       ignoreEnvironmentModel: true,
     })
   }
-  return createCodexProvider({
-    responsesBaseURL: `${baseURL}/v1`,
+  return createOpenAIResponsesOutboxProvider({
+    baseUrl: `${baseURL}/v1`,
     apiKey,
     model,
     authScheme: 'x-api-key',
@@ -139,8 +142,8 @@ async function ccRelayProviderFor(upstream: string, inboundBeta?: string): Promi
       ignoreEnvironmentModel: true,
     })
   }
-  return createCodexProvider({
-    responsesBaseURL: `${baseURL}/v1`,
+  return createOpenAIResponsesOutboxProvider({
+    baseUrl: `${baseURL}/v1`,
     apiKey,
     model: upstream,
     authScheme: 'x-api-key',
@@ -160,7 +163,7 @@ function localProviderFor(entry: RegistryEntry, opts: PickProviderOpts): WirePro
     if (codexCredit?.type !== 'oauth' || !codexCredit.source) {
       throw new Error(`${entry.id} requires a ChatGPT OAuth credit (~/.codex/auth.json)`)
     }
-    return createCodexProvider({ source: codexCredit.source, model: entry.upstream })
+    return createCodexResponsesOutboxProvider({ source: codexCredit.source, model: entry.upstream })
   }
   const claudeCredit = credits.find(c => c.provider === 'claude')
   if (!claudeCredit) throw new Error(`${entry.id} requires an Anthropic credit`)
@@ -389,7 +392,7 @@ export function pickWireProvider(opts: PickProviderOpts): WireProvider | null {
   const codexCredit = credits.find(c => c.provider === 'codex')
   if (codexCredit) {
     if (codexCredit.type === 'oauth' && codexCredit.source) {
-      return createCodexProvider({ source: codexCredit.source })
+      return createCodexResponsesOutboxProvider({ source: codexCredit.source })
     }
   }
 
@@ -466,18 +469,32 @@ export function createWireAdapter(
       url: prepared.url,
       headers: redactGatewayHeaders(prepared.headers),
       bodyBytes: prepared.body instanceof Uint8Array ? prepared.body.byteLength : prepared.body.length,
+      scheduling: summarizeOutboxScheduling(prepared.body),
     }, 'Compiled outbox request')
+
+    if (prepared.createAnthropicInboxResponse) {
+      requestLogger.info(
+        { event: 'outbox.response_streaming', durationMs: Math.round(performance.now() - t0), transport: 'websocket' },
+        'Streaming outbox response through agent-ir',
+      )
+      try {
+        return await prepared.createAnthropicInboxResponse(createAgentIrResponseObservation(requestLogger))
+      } catch (err: any) {
+        requestLogger.error({ event: 'outbox.request_failed', error: err }, 'Outbox request failed')
+        return errorResponse(502, `wire ${provider.name} upstream WebSocket failed: ${err?.message ?? err}`)
+      }
+    }
 
     let upstream: Response
     try {
       requestLogger.debug({ event: 'outbox.request_started' }, 'Sending outbox request')
       upstream = await globalThis.fetch(prepared.url, {
-        method: 'POST',
-        headers: prepared.headers,
-        // lib.dom from the legacy project omits Uint8Array from BodyInit;
-        // Bun fetch accepts it and Connect/protobuf requires those raw bytes.
-        body: prepared.body as any,
-      })
+          method: 'POST',
+          headers: prepared.headers,
+          // lib.dom from the legacy project omits Uint8Array from BodyInit;
+          // Bun fetch accepts it and Connect/protobuf requires those raw bytes.
+          body: prepared.body as any,
+        })
     } catch (err: any) {
       requestLogger.error({ event: 'outbox.request_failed', error: err }, 'Outbox request failed')
       return errorResponse(502, `wire ${provider.name} upstream fetch failed: ${err?.message ?? err}`)
@@ -488,6 +505,16 @@ export function createWireAdapter(
       status: upstream.status,
       headers: redactGatewayHeaders(upstream.headers),
     }, 'Received outbox response')
+
+    // Responses Outbox 由 agent-ir 立即 readOutboxResponse → 流守卫 → Anthropic Inbox 编码。它已经在
+    // 首个语义事件前处理失败边界；绝不能再落回下面的 Emitter 缓冲/重试支路。
+    if (prepared.writeAnthropicInboxResponse) {
+      requestLogger.info(
+        { event: 'outbox.response_streaming', durationMs: Math.round(performance.now() - t0) },
+        'Streaming outbox response through agent-ir',
+      )
+      return prepared.writeAnthropicInboxResponse(upstream, createAgentIrResponseObservation(requestLogger))
+    }
 
     if (!upstream.ok) {
       const text = await upstream.text().catch(() => '')
@@ -536,6 +563,7 @@ export function createWireAdapter(
       const logged = teeGatewaySseResponseForTraceLogging(requestLogger, attemptResp)
       const em = new AnthropicEventEmitter(trace, requestLogger)
       try {
+        if (!provider.parseStream) throw new Error(`wire ${provider.name} has no legacy stream parser`)
         await provider.parseStream(logged, em)
       } catch (err: any) {
         requestLogger.error({ event: 'outbox.stream_parse_failed', attempt, error: err }, 'Outbox stream parsing failed')

@@ -4,7 +4,7 @@
  * codex CLI (`wire_api="responses"`) speaks the Responses protocol: requests carry
  * `instructions` + `input[]` (ResponseItem[]) instead of `messages[]`, and it expects
  * the reply as `response.*` SSE events (NOT chat.completion chunks). This module is the
- * exact inverse of provider/codex_provider.ts: that file translates Anthropic→Responses
+ * exact inverse of agent-ir 的 OpenAI Responses Outbox：该库负责 Anthropic/Responses → IR → wire
  * for the OUTBOUND codex backend; here we translate Responses→Anthropic on the INBOUND
  * edge and re-encode the Anthropic-canonical SSE stream back into Responses events.
  *

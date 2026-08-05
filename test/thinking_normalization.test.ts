@@ -4,7 +4,7 @@ import { MessagesIngressAdapter } from '../src/inbox.js'
 import { decodeResponsesToAnthropic } from '../src/responses_api.js'
 import { parseAnthropicThinking, parseReasoningEffort, toAnthropicThinking } from '../src/thinking.js'
 import { createAnthropicPassthroughProvider } from '../src/providers/anthropic_passthrough_provider.js'
-import { createCodexProvider } from '../src/providers/codex_provider.js'
+import { createCodexResponsesOutboxProvider } from '../src/providers/codex_responses_outbox.js'
 import { createOpenaiCompatProvider } from '../src/providers/openai_compat_provider.js'
 
 let previousDefaultEffort: string | undefined
@@ -80,9 +80,9 @@ describe('reasoning effort normalization', () => {
 
   test('tier exits as a tier on Codex and OpenAI-compatible wires', async () => {
     const request = { messages: [], reasoning: { mode: 'effort' as const, effort: 'max' as const, source: 'client' as const } }
-    const codex = JSON.parse((await createCodexProvider({ accessToken: 'x.fake.token' }).buildRequest(request)).body)
+    const codex = JSON.parse((await createCodexResponsesOutboxProvider({ accessToken: 'x.fake.token' }).buildRequest(request)).body)
     const compat = JSON.parse((await createOpenaiCompatProvider({ baseURL: 'https://example.invalid/v1', apiKey: 'key', model: 'test' }).buildRequest(request)).body)
-    expect(codex.reasoning).toEqual({ effort: 'high' })
+    expect(codex.reasoning).toMatchObject({ effort: 'high' })
     expect(compat.reasoning_effort).toBe('high')
     expect(compat.reasoning).toBeUndefined()
   })

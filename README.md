@@ -20,7 +20,7 @@ Gemini** 各家，用 **Anthropic 格式作为统一中间表示（canonical IR�
 ```
 
 - IR = Anthropic Messages 格式（注释里称 `Anthropic-canonical`）。
-- 后端契约 = `WireProvider`：`buildRequest`（IR→厂商 wire，= lower）+ `parseStream`（厂商 SSE→IR，= lift）。
+- 后端契约 = `WireProvider`：`buildRequest`（IR→厂商 wire）+ `parseStream`（厂商 SSE→IR）。
 - `createWireAdapter` 串起整条管线（解码→压图→选 provider→重试→回流 IR SSE）。
 
 ## 目录树（单向递降，facade 先行）
@@ -30,19 +30,21 @@ src/
 ├ index.ts        ── facade：pickWireProvider 选后端 · createWireAdapter 管线 · resolveModel/latestUserInput 路由
 ├ server.ts       ── 入口：Bun.serve，三协议 HTTP 端点 → index.ts
 ├ types.ts        ── L0 IR 类型契约（AnthropicMessagesRequest / WireProvider / …）
-├ emitter.ts      ── Anthropic SSE 事件发射器（各 provider lift 的目标）
+├ emitter.ts      ── Anthropic SSE 事件发射器（旧 provider 的目标）
 ├ sse.ts          ── SSE 解析原语（iterSSE / tryParseJSON）
 ├ auth.ts         ── 本地凭据探测 + OAuth 刷新（Claude / Codex Source）
 ├ logging.ts      ── Pino 日志装配：等级、格式、脱敏与每请求 trace 上下文
 ├ image_compress.ts ── 入站图片自动压缩（magick，可选）
 ├ passthrough.ts  ── 非 /v1/messages 请求直透判定
-├ responses_api.ts ── OpenAI Responses ⇄ canonical 编解码（codex 入口用）
+├ responses_api.ts ── OpenAI Responses ⇄ canonical 编解码（兼容入口用）
 └ providers/      ── L2 后端实现，各自一家厂商 wire
    ├ antigravity_provider.ts        ── Gemini via Google CloudCode
-   ├ codex_provider.ts              ── ChatGPT Codex Responses
+   ├ codex_responses_outbox.ts      ── ChatGPT OAuth、账户头与 agent-ir Responses Outbox 装配
+   ├ codex_models.ts                ── ChatGPT Codex 模型目录与映射
+   ├ openai_responses_outbox.ts     ── 标准 Responses 的 agent-ir 装配
    ├ openai_compat_provider.ts      ── OpenAI Chat Completions / Gemini-OAI
    ├ anthropic_passthrough_provider.ts ── Claude（OAuth / API key 直透）
-   └ windsurf_agent_ir_provider.ts  ── Windsurf Connect/protobuf（由 agent-ir lower/lift）
+   └ windsurf_agent_ir_provider.ts  ── Windsurf Connect/protobuf（由 agent-ir 编译与读取）
 ```
 
 **import 方向（单向，无环）**：`types` ← 所有；`emitter/sse/auth` ← `providers`；

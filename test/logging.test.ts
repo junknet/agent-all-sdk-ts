@@ -7,6 +7,8 @@ import {
   parseGatewayLogFormat,
   parseGatewayLogLevel,
   redactGatewayHeaders,
+  summarizeOutboxScheduling,
+  summarizeResponsesSchedulingEvent,
   type GatewayLogFormat,
 } from '../src/logging.js'
 
@@ -62,4 +64,30 @@ test('logging configuration accepts only documented environment values', () => {
   })).toEqual({ level: 'warn', format: 'text' })
   expect(() => parseGatewayLogLevel('verbose')).toThrow('AGENT_GATEWAY_LOG_LEVEL')
   expect(() => parseGatewayLogFormat('ndjson')).toThrow('AGENT_GATEWAY_LOG_FORMAT')
+})
+
+test('outbox scheduling audit omits prompt content and preserves service tier', () => {
+  const audit = summarizeOutboxScheduling(JSON.stringify({
+    model: 'gpt-5.6-terra',
+    service_tier: 'priority',
+    stream: true,
+    input: 'private user prompt must never be logged',
+  }))
+
+  expect(audit).toEqual({ model: 'gpt-5.6-terra', serviceTier: 'priority', stream: true })
+  expect(JSON.stringify(audit)).not.toContain('private user prompt')
+  expect(summarizeOutboxScheduling(new Uint8Array([0xff]))).toBeUndefined()
+})
+
+test('Responses scheduling audit extracts only the response.created acknowledgement', () => {
+  const event = summarizeResponsesSchedulingEvent(JSON.stringify({
+    type: 'response.created',
+    response: {
+      model: 'gpt-5.6-terra', service_tier: 'priority', status: 'in_progress', output: 'must not be logged',
+    },
+  }))
+
+  expect(event).toEqual({ model: 'gpt-5.6-terra', serviceTier: 'priority', status: 'in_progress' })
+  expect(JSON.stringify(event)).not.toContain('must not be logged')
+  expect(summarizeResponsesSchedulingEvent('{"type":"response.completed"}')).toBeUndefined()
 })

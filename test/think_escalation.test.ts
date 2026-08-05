@@ -1,7 +1,7 @@
 import { expect, test, describe } from 'bun:test'
 import { resolveModel, latestUserInput } from '../src/index.js'
 
-// The 「思考」 escalation must be a per-input STATE MACHINE: a human input with 「思考」 lifts
+// The 「思考」 escalation must be a per-input STATE MACHINE: a human input with 「思考」 moves
 // the gear and HOLDS across that turn's whole agent tool-loop; the NEXT human input without
 // 「思考」 drops it back. It must NOT be sticky-forever (one 「思考」 anywhere in history keeping
 // every later request escalated). These tests pin that contract across all three protocols.

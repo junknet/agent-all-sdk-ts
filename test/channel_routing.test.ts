@@ -9,7 +9,7 @@ const validEntry = {
   images: false,
   tools: true,
   contextWindow: 131072,
-  maxOutputTokens: 32768,
+  maxOutputTokens: 1000000,
   verified: false,
 }
 
@@ -25,6 +25,10 @@ describe('model registry validation', () => {
       // OpenRouter's `vendor/model[:variant]` ids.
       expect(entry.id).toBe(`${entry.channel}-${sanitizeUpstreamForId(entry.upstream)}`)
     }
+  })
+
+  test('publishes one-million-token context windows for every model', () => {
+    for (const entry of listRegistry()) expect(entry.contextWindow).toBe(1_000_000)
   })
 
   test('a local entry always names the catalog that proves its availability', () => {

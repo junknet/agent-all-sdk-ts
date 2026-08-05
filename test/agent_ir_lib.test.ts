@@ -1,7 +1,7 @@
 /**
  * 验证 agent-ir 作为本仓库的 lib 依赖可用的最小闭环。
  *
- * 不是迁移:本仓库保留 server / 凭据 / 模型注册表,把「协议解码 → IR → 能力裁决 → 出口 lower/lift」
+ * 不是迁移:本仓库保留 server / 凭据 / 模型注册表,把「协议解码 → IR → 能力裁决 → writeOutboxRequest/readOutboxResponse」
  * 这一整条决策链交给 agent-ir lib。本测试只锁边界:
  *
  *  1. 从 node_modules 的 agent-ir 包能 import 出 IR 类型与注册表

@@ -1,6 +1,5 @@
 import { expect, test } from 'bun:test'
 import { AnthropicEventEmitter } from '../src/emitter.js'
-import { createCodexProvider } from '../src/providers/codex_provider.js'
 import { createOpenaiCompatProvider } from '../src/providers/openai_compat_provider.js'
 import { toolResultToResponse } from '../src/providers/antigravity_provider.js'
 import { createAntigravityProvider } from '../src/providers/antigravity_provider.js'
@@ -109,48 +108,6 @@ test('openai-compat buffers interleaved streaming tool calls by index', async ()
   ])
 })
 
-test('codex responses buffers interleaved function call argument deltas by item id', async () => {
-  const provider = createCodexProvider({ accessToken: 'x.fake.token' })
-  const emitter = new AnthropicEventEmitter()
-
-  await provider.parseStream(
-    streamResponse([
-      {
-        type: 'response.output_item.added',
-        output_index: 0,
-        item: { id: 'fc_first', type: 'function_call', call_id: 'call_first', name: 'first' },
-      },
-      {
-        type: 'response.output_item.added',
-        output_index: 1,
-        item: { id: 'fc_second', type: 'function_call', call_id: 'call_second', name: 'second' },
-      },
-      { type: 'response.function_call_arguments.delta', item_id: 'fc_first', delta: '{"a"' },
-      { type: 'response.function_call_arguments.delta', item_id: 'fc_second', delta: '{"b"' },
-      { type: 'response.function_call_arguments.delta', item_id: 'fc_first', delta: ':1}' },
-      { type: 'response.function_call_arguments.delta', item_id: 'fc_second', delta: ':2}' },
-      {
-        type: 'response.output_item.done',
-        output_index: 0,
-        item: { id: 'fc_first', type: 'function_call', call_id: 'call_first', name: 'first' },
-      },
-      {
-        type: 'response.output_item.done',
-        output_index: 1,
-        item: { id: 'fc_second', type: 'function_call', call_id: 'call_second', name: 'second' },
-      },
-      { type: 'response.completed', response: { usage: { input_tokens: 1, output_tokens: 2 } } },
-    ]),
-    emitter,
-  )
-
-  const tools = collectToolBlocks(parseAnthropicEvents(emitter.drain()))
-  expect(tools).toEqual([
-    { id: 'call_first', name: 'first', partialJson: '{"a":1}' },
-    { id: 'call_second', name: 'second', partialJson: '{"b":2}' },
-  ])
-})
-
 test('openai-compat translates user message images to content array', async () => {
   const provider = createOpenaiCompatProvider({
     baseURL: 'https://example.invalid/v1',
@@ -201,35 +158,6 @@ test('openai-compat uses x-api-key when the compatible endpoint requires it', as
   expect(request.headers).toEqual({
     'Content-Type': 'application/json',
     'x-api-key': 'test-key',
-  })
-})
-
-test('responses compatibility provider preserves the published model and x-api-key auth', async () => {
-  const provider = createCodexProvider({
-    responsesBaseURL: 'https://example.invalid/v1',
-    apiKey: 'test-key',
-    model: 'gpt-5-4',
-    authScheme: 'x-api-key',
-  })
-
-  const request = await provider.buildRequest({
-    model: 'gpt-5-4',
-    messages: [{ role: 'user', content: 'hello' }],
-  })
-
-  expect(request.url).toBe('https://example.invalid/v1/responses')
-  expect(request.headers).toEqual({
-    'Content-Type': 'application/json',
-    Accept: 'text/event-stream',
-    'x-api-key': 'test-key',
-  })
-  expect(JSON.parse(request.body)).toMatchObject({
-    model: 'gpt-5-4',
-    input: [{
-      type: 'message',
-      role: 'user',
-      content: [{ type: 'input_text', text: 'hello' }],
-    }],
   })
 })
 
@@ -301,34 +229,6 @@ test('openai-compat translates tool results with images to markdown', async () =
       content: 'Result is successful\n![image](data:image/png;base64,fake-base64)',
     },
   ])
-})
-
-test('codex translates tool results with images to markdown inline image', async () => {
-  const provider = createCodexProvider({ accessToken: 'x.fake.token' })
-  const req = await provider.buildRequest({
-    messages: [
-      {
-        role: 'user',
-        content: [
-          {
-            type: 'tool_result',
-            tool_use_id: 'call_123',
-            content: [
-              { type: 'text', text: 'Screenshot output' },
-              {
-                type: 'image',
-                source: { type: 'base64', media_type: 'image/jpeg', data: 'fake-jpeg' },
-              },
-            ],
-          },
-        ],
-      },
-    ],
-  })
-  const body = JSON.parse(req.body)
-  const item = body.input.find((m: any) => m.type === 'function_call_output')
-  expect(item).toBeDefined()
-  expect(item.output).toBe('Screenshot output\n![image](data:image/jpeg;base64,fake-jpeg)')
 })
 
 test('antigravity aggregates multiple images in tool result', () => {

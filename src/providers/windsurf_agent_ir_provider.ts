@@ -2,7 +2,7 @@
  * Windsurf adapter backed by agent-ir.
  *
  * `agent-all-sdk-ts` owns HTTP inbox/SSE outbox and credential discovery;
- * `agent-ir` owns the Connect/protobuf lowering and lifting contract.  Keeping
+ * `agent-ir` owns the Connect/protobuf writeOutboxRequest and readOutboxResponse contract. Keeping
  * that seam here means the gateway never reimplements Windsurf wire details.
  */
 import { readFileSync } from 'node:fs'
