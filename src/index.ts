@@ -230,6 +230,14 @@ export async function pickRegistryWireProvider(
         supportsImages: entry.images,
         ignoreEnvironmentModel: true,
       })
+    case 'openrouter':
+      return createOpenaiCompatProvider({
+        baseURL: process.env.OPENROUTER_BASE_URL ?? 'https://openrouter.ai/api/v1',
+        apiKey: process.env.OPENROUTER_API_KEY ?? opts.apiKey ?? '',
+        model: entry.upstream,
+        supportsImages: entry.images,
+        ignoreEnvironmentModel: true,
+      })
     case 'local':
       return localProviderFor(entry, opts)
   }

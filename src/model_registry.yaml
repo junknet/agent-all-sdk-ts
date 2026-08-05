@@ -44,6 +44,9 @@ channels:
   bailian:
     description: 阿里百炼 DashScope OpenAI 兼容端点
     requires_env: DASHSCOPE_API_KEY
+  openrouter:
+    description: OpenRouter OpenAI 兼容端点 (openrouter.ai)
+    requires_env: OPENROUTER_API_KEY
 
 # ── 能力模板 ────────────────────────────────────────────────────────────
 _templates:
@@ -164,6 +167,22 @@ _templates:
     contextWindow: 131072
     maxOutputTokens: 32768
     verified: false
+
+  # OpenRouter 的 GET /api/v1/models 有完整字段(2026-08-05 实测)，可直接采信：
+  # deepseek/deepseek-v4-flash-0731 的 top_provider.context_length=1048576，
+  # max_completion_tokens=65536，reasoning.supported_efforts=[max,high,low]，
+  # default_effort=high。architecture.input_modalities 只有 text，无 image。
+  openrouter_deepseek: &openrouter_deepseek
+    channel: openrouter
+    images: false
+    tools: true
+    contextWindow: 1048576
+    maxOutputTokens: 65536
+    thinking:
+      efforts: [low, high, max]
+      default: high
+      canDisable: true
+    verified: true
 
 # ── 合法 model id 全表 ──────────────────────────────────────────────────
 models:
@@ -328,3 +347,11 @@ models:
   - id: ccr-kimi-k3
     <<: *ccr_chat
     upstream: kimi-k3
+
+  # ── openrouter: openrouter.ai OpenAI 兼容端点 ─────────────────────────
+  # `:nitro` 是 OpenRouter 的 provider-routing 后缀，选择吞吐优先的供货商。
+  # upstream 保留完整 canonical_slug + 后缀原样发给上游；'/' 与 ':' 在发布 id
+  # 里都替换成 '-'（见 model_registry.ts sanitizeUpstreamForId）。
+  - id: openrouter-deepseek-deepseek-v4-flash-20260731-nitro
+    <<: *openrouter_deepseek
+    upstream: deepseek/deepseek-v4-flash-20260731:nitro

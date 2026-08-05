@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { listRegistry, parseModelRegistry } from '../src/model_registry.js'
+import { listRegistry, parseModelRegistry, sanitizeUpstreamForId } from '../src/model_registry.js'
 import { pickRegistryWireProvider, resolveModel } from '../src/index.js'
 
 const validEntry = {
@@ -19,7 +19,11 @@ describe('model registry validation', () => {
     const ids = entries.map(entry => entry.id)
     expect(new Set(ids).size).toBe(ids.length)
     for (const entry of entries) {
-      expect(entry.id).toBe(`${entry.channel}-${entry.upstream}`)
+      // The suffix is the upstream id with '/' and ':' sanitized to '-' (see
+      // sanitizeUpstreamForId): every non-OpenRouter upstream is already
+      // dash-only, so this is a no-op for them and an identity check for
+      // OpenRouter's `vendor/model[:variant]` ids.
+      expect(entry.id).toBe(`${entry.channel}-${sanitizeUpstreamForId(entry.upstream)}`)
     }
   })
 

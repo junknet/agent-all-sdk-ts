@@ -23,7 +23,7 @@ import { readFileSync } from 'fs'
 import * as path from 'path'
 import type { ModelInfo, ThinkingEffort } from './types.js'
 
-export type RegistryChannel = 'local' | 'windsurf' | 'ccr' | 'official' | 'bailian'
+export type RegistryChannel = 'local' | 'windsurf' | 'ccr' | 'official' | 'bailian' | 'openrouter'
 
 /** Availability probe that gates a `local` entry; other channels are env-gated. */
 export type RegistrySource = 'antigravity' | 'codex' | 'claude'
@@ -51,7 +51,14 @@ export interface RegistryEntry {
   readonly verified: boolean
 }
 
-const CHANNELS: readonly RegistryChannel[] = ['local', 'windsurf', 'ccr', 'official', 'bailian']
+const CHANNELS: readonly RegistryChannel[] = [
+  'local',
+  'windsurf',
+  'ccr',
+  'official',
+  'bailian',
+  'openrouter',
+]
 const SOURCES: readonly RegistrySource[] = ['antigravity', 'codex', 'claude']
 const EFFORTS: readonly ThinkingEffort[] = [
   'minimal',
@@ -64,6 +71,16 @@ const EFFORTS: readonly ThinkingEffort[] = [
 
 function fail(id: string, message: string): never {
   throw new Error(`model_registry.yaml: '${id}' ${message}`)
+}
+
+/**
+ * Map an upstream model id onto the dash-only suffix a published id must use.
+ * OpenRouter ids are `vendor/model[:variant]` (e.g.
+ * `deepseek/deepseek-v4-flash-20260731:nitro`); '/' and ':' become '-' so the
+ * published id stays dash-only (see file header on why '/' is unsafe).
+ */
+export function sanitizeUpstreamForId(upstream: string): string {
+  return upstream.replace(/[/:]/g, '-')
 }
 
 function requirePositiveInt(value: unknown, id: string, field: string): number {
@@ -132,7 +149,13 @@ function parseEntry(raw: unknown, seen: Set<string>): RegistryEntry {
   if (typeof upstream !== 'string' || upstream.length === 0) {
     fail(id, 'has no upstream model id')
   }
-  if (id.slice(String(channel).length + 1) !== upstream) {
+  // The published id must stay dash-only (OMP proxy discovery drops any id
+  // containing '/', see file header), but some upstreams — OpenRouter's
+  // `vendor/model[:variant]` — are not dash-only themselves. The id suffix is
+  // therefore the upstream string with '/' and ':' sanitized to '-'; every
+  // existing upstream is already dash-only, so this is a no-op for them.
+  const idSuffix = sanitizeUpstreamForId(upstream as string)
+  if (id.slice(String(channel).length + 1) !== idSuffix) {
     fail(id, `disagrees with its upstream id '${upstream}'`)
   }
 

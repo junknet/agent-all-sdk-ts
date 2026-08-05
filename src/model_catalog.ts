@@ -86,6 +86,8 @@ function isReachable(
       return !!process.env.DEEPSEEK_API_KEY
     case 'bailian':
       return !!process.env.DASHSCOPE_API_KEY
+    case 'openrouter':
+      return !!process.env.OPENROUTER_API_KEY
   }
 }
 

@@ -74,14 +74,19 @@ PROXY_UNSET=(-u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy
 # DeepSeek 的两个平台必须同时注入，模型目录才会同时发布：
 #   official/deepseek-* -> DEEPSEEK_API_KEY -> api.deepseek.com
 #   bailian/deepseek-*  -> DASHSCOPE_API_KEY -> DashScope
+# openrouter/* -> OPENROUTER_API_KEY -> openrouter.ai
 # 允许显式环境变量覆盖；未设置时从本机 600 权限密钥文件加载。
 DEEPSEEK_KEY_FILE="${DEEPSEEK_KEY_FILE:-$HOME/.config/omp/deepseek.key}"
 DASHSCOPE_KEY_FILE="${DASHSCOPE_KEY_FILE:-$HOME/.config/omp/dashscope.key}"
+OPENROUTER_KEY_FILE="${OPENROUTER_KEY_FILE:-$HOME/.config/omp/openrouter.key}"
 if [[ -z "${DEEPSEEK_API_KEY:-}" && -r "$DEEPSEEK_KEY_FILE" ]]; then
   export DEEPSEEK_API_KEY="$(<"$DEEPSEEK_KEY_FILE")"
 fi
 if [[ -z "${DASHSCOPE_API_KEY:-}" && -r "$DASHSCOPE_KEY_FILE" ]]; then
   export DASHSCOPE_API_KEY="$(<"$DASHSCOPE_KEY_FILE")"
+fi
+if [[ -z "${OPENROUTER_API_KEY:-}" && -r "$OPENROUTER_KEY_FILE" ]]; then
+  export OPENROUTER_API_KEY="$(<"$OPENROUTER_KEY_FILE")"
 fi
 
 # 调用方显式传了 OPENAI_API_KEY 就尊重它, 否则清掉(见上文 why 2)。单后端

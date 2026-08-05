@@ -78,6 +78,16 @@ src/
   `https://dashscope.aliyuncs.com/compatible-mode/v1`，使用 `DASHSCOPE_API_KEY`、
   `DASHSCOPE_BASE_URL`、`DASHSCOPE_MODEL`（可选）配置。百炼出口只接受明确的
   `bailian/` 前缀，不会把其他模型目录污染到本路由。
+- **OpenRouter 前缀**：`openrouter-<sanitized-upstream>` 走
+  `https://openrouter.ai/api/v1`（OpenAI 兼容），使用 `OPENROUTER_API_KEY`，可选
+  `OPENROUTER_BASE_URL` 覆盖。OpenRouter 的原生 model id 形如
+  `vendor/model[:variant]`（如 `deepseek/deepseek-v4-flash-20260731:nitro`，
+  `:nitro` 是选高吞吐供货商的 provider-routing 后缀），但发布的网关 id 必须
+  dash-only（见 `model_registry.ts` 头注释：OMP 的 proxy discovery 会丢弃含 `/`
+  的 id）。因此发布 id 把 upstream 里的 `/` 与 `:` 都替换成 `-`
+  （`sanitizeUpstreamForId`），例如
+  `openrouter-deepseek-deepseek-v4-flash-20260731-nitro`；路由时按注册表把它还原
+  回真实的 OpenRouter slug 发给上游，不经过任何思考升档改写。
 - 官方配置：`DEEPSEEK_API_KEY`，可用 `DEEPSEEK_ANTHROPIC_BASE_URL` 覆盖 Anthropic
   兼容入口。官方透传原生 Anthropic 请求，不经过 OpenAI schema 转换。
 - 两个平台都关闭了本路由的「思考升档」改写，避免 DeepSeek 请求被误改成 Gemini。
