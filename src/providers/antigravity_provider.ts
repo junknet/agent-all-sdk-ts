@@ -34,11 +34,23 @@ interface TokenStore {
   expiry_date?: number
 }
 
-const CLIENT_ID =
-  process.env.ANTIGRAVITY_CLIENT_ID ||
-  '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com'
-const CLIENT_SECRET =
-  process.env.ANTIGRAVITY_CLIENT_SECRET || 'ANTIGRAVITY_CLIENT_SECRET_REMOVED'
+// Antigravity 的 Google OAuth 客户端凭证不入库：GOCSPX- 前缀会被 GitHub secret
+// scanning 命中并通报 Google，导致 client 被吊销。改由 start_gateway.sh 从本机
+// 0600 文件 ~/.config/omp/antigravity.env 注入(与 DEEPSEEK/DASHSCOPE 同一套路)。
+//
+// 惰性解析而非模块级 throw：只有 refresh 分支需要这对凭证，access_token 未过期
+// 时整条出口照常工作；模块级抛错会让 import 这个 provider 的测试和目录探活一起死。
+function requireOAuthClient(): { clientId: string; clientSecret: string } {
+  const clientId = process.env.ANTIGRAVITY_CLIENT_ID
+  const clientSecret = process.env.ANTIGRAVITY_CLIENT_SECRET
+  if (!clientId || !clientSecret) {
+    throw new Error(
+      'Antigravity token refresh needs ANTIGRAVITY_CLIENT_ID + ANTIGRAVITY_CLIENT_SECRET. ' +
+        'Put them in ~/.config/omp/antigravity.env (mode 0600); start_gateway.sh loads it.',
+    )
+  }
+  return { clientId, clientSecret }
+}
 function getGeminiTokenPath(): string {
   const customDir = process.env.GATEWAY_CREDENTIALS_DIR
   if (customDir) {
@@ -73,12 +85,13 @@ export async function getOrRefreshAccessToken(): Promise<string> {
   if (!expired) return store.access_token
   if (!store.refresh_token) throw new Error('access_token expired and no refresh_token available')
 
+  const { clientId, clientSecret } = requireOAuthClient()
   const res = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': USER_AGENT },
     body: new URLSearchParams({
-      client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET,
+      client_id: clientId,
+      client_secret: clientSecret,
       refresh_token: store.refresh_token,
       grant_type: 'refresh_token',
     }).toString(),

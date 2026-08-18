@@ -193,6 +193,8 @@ export class MemoryTokenSource implements TokenSource {
 }
 
 // ── Claude OAuth Source ──────────────────────────────────────────────
+// Public OAuth client id(PKCE 公共客户端，无配套 secret)，按 RFC 8252 本就不是机密。
+// 与之相对，带 secret 的凭证一律走环境变量，不入库(见 antigravity_provider.ts)。
 const CLAUDE_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 const CLAUDE_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token'
 const CLAUDE_USER_AGENT = 'claude-cli/2.1.123 (external, sdk-cli)'
@@ -307,6 +309,7 @@ export class ClaudeOAuthSource implements TokenSource {
 }
 
 // ── Codex OAuth Source ──────────────────────────────────────────────
+// 同上：Codex CLI 的 public client id，无 secret。
 const CODEX_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
 const CODEX_TOKEN_URL = 'https://auth.openai.com/oauth/token'
 

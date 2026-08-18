@@ -79,6 +79,10 @@ PROXY_UNSET=(-u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy
 DEEPSEEK_KEY_FILE="${DEEPSEEK_KEY_FILE:-$HOME/.config/omp/deepseek.key}"
 DASHSCOPE_KEY_FILE="${DASHSCOPE_KEY_FILE:-$HOME/.config/omp/dashscope.key}"
 OPENROUTER_KEY_FILE="${OPENROUTER_KEY_FILE:-$HOME/.config/omp/openrouter.key}"
+# Antigravity 走 Google OAuth，需要的是 client_id+client_secret 一对，不是单行 key，
+# 所以用 env 文件而非 *.key。这对凭证曾经硬编码在 antigravity_provider.ts 里，
+# GOCSPX- 前缀会被 GitHub secret scanning 命中并通报 Google，已移出仓库。
+ANTIGRAVITY_ENV_FILE="${ANTIGRAVITY_ENV_FILE:-$HOME/.config/omp/antigravity.env}"
 if [[ -z "${DEEPSEEK_API_KEY:-}" && -r "$DEEPSEEK_KEY_FILE" ]]; then
   export DEEPSEEK_API_KEY="$(<"$DEEPSEEK_KEY_FILE")"
 fi
@@ -87,6 +91,16 @@ if [[ -z "${DASHSCOPE_API_KEY:-}" && -r "$DASHSCOPE_KEY_FILE" ]]; then
 fi
 if [[ -z "${OPENROUTER_API_KEY:-}" && -r "$OPENROUTER_KEY_FILE" ]]; then
   export OPENROUTER_API_KEY="$(<"$OPENROUTER_KEY_FILE")"
+fi
+if [[ -z "${ANTIGRAVITY_CLIENT_SECRET:-}" && -r "$ANTIGRAVITY_ENV_FILE" ]]; then
+  [[ "$(stat -c '%a' -- "$ANTIGRAVITY_ENV_FILE")" == "600" ]] || {
+    echo "[fail] $ANTIGRAVITY_ENV_FILE must have mode 0600" >&2
+    exit 1
+  }
+  set -a
+  # shellcheck source=/dev/null
+  source "$ANTIGRAVITY_ENV_FILE"
+  set +a
 fi
 
 # 调用方显式传了 OPENAI_API_KEY 就尊重它, 否则清掉(见上文 why 2)。单后端

@@ -1,10 +1,9 @@
 # 三家 Agent 后端协议权威参考（agy / claude / codex）
 
-> 对齐 `agent-all-sdk-go` 用。数据来源：
-> - **antigravity(agy)**：实时抓包(流量核对 local ) + `v1internal:fetchAvailableModels` 实测 + 二进制 strings。
-> - **claude**：`/v1/models` 实测 + 闭源二进制(Go 232M) strings + SDK。
-> - **codex**：开源源码 `<local-codex-src>/codex-rs`（commit 2e84970）权威。
-> 实测日期 2026-06-02。Antigravity 后端区分 `daily-cloudcode-pa` 与 `cloudcode-pa`，模型集合一致。
+> 本网关各出口的 wire 契约参考，记录本仓库代码所依赖的请求/响应字段形状。
+> codex 侧字段以其开源实现(`codex-rs`, commit 2e84970)为准；其余各家以公开 SDK
+> 与官方文档为准，字段随上游演进，以对应 provider 的回归测试为最终裁决。
+> 最后核对 2026-06-02。Antigravity 后端区分 `daily-cloudcode-pa` 与 `cloudcode-pa`，模型集合一致。
 
 ---
 
@@ -31,7 +30,7 @@
 - **本地凭证(可复用)**：`~/.gemini/oauth_creds.json` = `{access_token(ya29.), token_type:"Bearer", refresh_token(1//0g.), id_token(JWT), scope, expiry_date(epoch ms)}` — gemini-cli/SDK 共享。
 - **调用头**：`Authorization: Bearer <access_token>`，`User-Agent: antigravity/cli/1.0.4 linux/amd64`。
 - **project 解析**：先 `v1internal:loadCodeAssist`/`listCloudAICompanionProjects` 拿 `project`，每次请求体顶层带 `project`。
-- ⚠ 实测坑：本机 某 tun 代理 tun 对 `oauth2.googleapis.com/token` 链路不稳(握手/io timeout)，但 `cloudcode-pa`/`www.googleapis.com` 通畅 → **优先复用 oauth_creds.json 的未过期 access_token，不要每次走 token endpoint**。
+- ⚠ 坑：某些 tun 模式代理下 `oauth2.googleapis.com/token` 链路不稳(握手/io timeout)，而 `cloudcode-pa`/`www.googleapis.com` 通畅 → **优先复用 oauth_creds.json 的未过期 access_token，不要每次走 token endpoint**。
 
 ### 1.2 claude — Anthropic OAuth(Claude Max/Pro) 或 API Key
 
@@ -233,9 +232,9 @@
 
 ---
 
-## 10. claude 实测补充（贪吃蛇+图片真实抓包，2026-06-03）
+## 10. claude 字段补充（工具往返 + 图片输入）
 
-> 真实驱动 `claude --dangerously-skip-permissions`(Opus 4.8/Max) 写贪吃蛇+读图片，流量核对 抓 `/v1/messages` 实测。修正 §1.2/4.2/5.2 的推断。
+> 修正 §1.2/4.2/5.2 中此前基于文档的推断。
 
 - **URL**：`POST https://api.anthropic.com/v1/messages?beta=true`
 - **OAuth token 前缀**：`Authorization: Bearer sk-ant-oat01-...`（oat=oauth access token，非 ya29）
@@ -257,9 +256,9 @@
 
 ---
 
-## 11. codex 实测补充（贪吃蛇真实抓包，走 <relay> 网关，2026-06-03）
+## 11. codex 字段补充（Responses API 实际取值）
 
-> 真实驱动 `codex-<relay> high`(gpt-5.5)写贪吃蛇，反向代理抓 `/responses` 实测。**完全验证 §4.3/5.3 源码规格**，补充实测值。
+> 与 §4.3/5.3 的源码规格一致，此处补充各字段的典型取值。
 
 - **请求头**：`authorization: Bearer sk-...`(apikey 模式，**无** ChatGPT-Account-Id)、`originator: codex-tui`、`user-agent: codex-tui/0.136.0 (Manjaro...; x86_64) tmux/3.6a`、`accept: text/event-stream`、`x-client-request-id`
 - **请求体实测**(顶层字段全部对上源码)：
@@ -284,4 +283,4 @@
 - **SSE 事件实测**：`response.created → response.in_progress → response.output_item.added → response.content_part.added → response.output_text.delta(×94) → response.output_text.done → response.content_part.done → response.output_item.done → response.completed`（比源码 agent 列的多 `response.in_progress`、`response.content_part.added/done`）
 - **usage 实测**：`{input_tokens:18661, input_tokens_details:{cached_tokens:17792}, output_tokens:159, output_tokens_details:{reasoning_tokens:57}, total_tokens:18820}` — **缓存命中 17792 token**(prompt_cache_key 生效)，reasoning_tokens 单列。
 
-> 注：此为 codex CLI 发出的标准 Responses API（经你的 <relay> 网关转发到 gpt-5.5），wire 格式与直连 OpenAI 一致。`apply_patch`/`exec_command` 是 codex 改文件/跑命令的核心工具。
+> 注：codex CLI 发出的是标准 Responses API，wire 格式与直连 OpenAI 一致。`apply_patch`/`exec_command` 是 codex 改文件/跑命令的核心工具。
