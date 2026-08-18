@@ -2,8 +2,6 @@ node_modules/
 *.log
 *.ndjson
 coverage.out
-.env
-.env.local
 .DS_Store
 Thumbs.db
 *.tmp
@@ -12,3 +10,47 @@ Thumbs.db
 .playwright-mcp/
 __pycache__/
 tmp/
+
+# ── 凭证 ──
+# 网关的密钥一律放 ~/.config/omp/*.key 与 ~/.config/agent-all-sdk-ts/cc-relay.env,
+# 本就不在仓库内。下面这些是兜底: 防止有人图省事在工作树里落一份。
+# 曾经踩过的坑: antigravity 的 client_secret 硬编码进源码推上了公网,
+# GOCSPX- 前缀会被 GitHub secret scanning 命中并通报 Google。
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.keystore
+*.jks
+credentials.json
+*_credentials.json
+auth.json
+*_auth.json
+oauth_creds.json
+secrets.*
+.netrc
+.npmrc
+
+# ── 抓包 / 调试产物 ──
+# 网关的请求响应里带 Authorization、x-api-key、ChatGPT-Account-Id。
+# 落盘的流量记录与 trace 一旦误提交就等于泄露全部出口凭证。
+*.har
+*.pcap
+*.pcapng
+*.流量核对
+traffic-logs/
+*-traffic-logs/
+trace/
+traces/
+*.trace.json
+
+# ── 一次性交接 / 现场笔记 ──
+# 这类文件记录本机路径、会话名、私有中转网关地址, 属于临时状态,
+# 不该进版本库(历史上 HANDOFF_CODEX_WEBSOCKET.md 就是这么泄的)。
+HANDOFF_*.md
+SCRATCH_*.md
+NOTES_*.md
+*.local.md
